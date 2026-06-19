@@ -17,6 +17,17 @@ every request**:
 2. **The capability path-ACL (dynamic, per request).** The invocation's
    `Capability` must grant the request's action for the resolved path.
 
+> **Scope of protection.** This model governs the **resource-oriented** surface
+> only: what is reachable by *resolving* `urn:file:` resources through the ikigai
+> kernel (`Source`/`Sink`/`Exists`/`Delete`). It is a resource-model protection,
+> not yet a hardened OS or process sandbox — code that bypasses resolution (a
+> loaded module making direct syscalls, or native code touching the filesystem
+> outside this endpoint) is not constrained by these layers. A more formal
+> **capabilities-based sandbox is coming**: ikigai capabilities will drive a
+> platform sandbox (WASI / `wasmtime`), so the resource model controls what the
+> platform allows the code running on it. The jail here is precisely a native
+> preview of a WASI preopen.
+
 ## Capability scopes
 
 Carried as `urn:cap:fs:<action>:<path>` scopes, where `<action>` is `read` /
@@ -51,10 +62,11 @@ let kernel = Kernel::new(Arc::new(ikigai_fs::space("/Users/me/workspace")));
 
 ## Platforms
 
-One crate, a `cfg`-gated backend. Native uses jailed `std::fs`. The `wasm32`
-backend (browser `localStorage`) is planned and currently returns a "not yet
-implemented" error, so the module still compiles and links into the in-browser
-host.
+One crate, a `cfg`-gated backend. Native stores in jailed `std::fs`; the `wasm32`
+backend stores in the browser's `localStorage` (keyed `ikigai:fs:<path>`). Same
+`file:` contract and `urn:cap:fs` scopes either way — only the storage primitive
+differs, so the module links into a native CLI and an in-browser host alike. The
+`localStorage` backend is text-oriented (it refuses non-UTF-8 writes).
 
 ## License
 
