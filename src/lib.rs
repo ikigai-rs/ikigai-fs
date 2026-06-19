@@ -516,7 +516,14 @@ mod tests {
         let root = temp_root();
         let ep = FileEndpoint::new(&root);
         let c = cap(&[&read_scope(&root), &write_scope(&root)]);
-        invoke(&ep, Verb::Sink, "notes.txt", &c, &[("content", b"remember this")]).unwrap();
+        invoke(
+            &ep,
+            Verb::Sink,
+            "notes.txt",
+            &c,
+            &[("content", b"remember this")],
+        )
+        .unwrap();
         let rep = invoke(&ep, Verb::Source, "notes.txt", &c, &[]).unwrap();
         assert_eq!(rep.bytes, b"remember this");
         std::fs::remove_dir_all(&root).ok();
@@ -577,7 +584,9 @@ mod tests {
         let read_only = cap(&[&read_scope(&root)]);
         // exists is a read
         assert_eq!(
-            invoke(&ep, Verb::Exists, "gone.txt", &read_only, &[]).unwrap().bytes,
+            invoke(&ep, Verb::Exists, "gone.txt", &read_only, &[])
+                .unwrap()
+                .bytes,
             b"true"
         );
         // delete needs the delete action — read-only is refused
