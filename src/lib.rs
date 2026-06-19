@@ -48,10 +48,11 @@
 //!
 //! ## Platforms
 //!
-//! One crate, a `cfg`-gated backend. The native backend (`std::fs`) is the
-//! confinement today; the `wasm32` backend (browser `localStorage`) is a planned
-//! step and currently returns a "not yet implemented" error, so the module still
-//! *compiles* for `wasm32` and links into the in-browser host.
+//! One crate, a `cfg`-gated backend. The native backend stores in jailed
+//! `std::fs`; the `wasm32` backend stores in the browser's `localStorage` (keyed
+//! `ikigai:fs:<path>`), so the same module — same `file:` contract, same
+//! capability scopes — links into a native CLI and an in-browser host alike. The
+//! `localStorage` backend is text-oriented (it refuses non-UTF-8 writes).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -351,31 +352,67 @@ mod backend {
     }
 }
 
-/// wasm32 backend: a browser `localStorage` store, mapping a path to a
-/// namespaced key. Not yet implemented — the module compiles and links for
-/// `wasm32` so the in-browser host can mount it; the storage primitives arrive in
-/// a follow-up step.
+/// wasm32 backend: the browser's `localStorage`, with the jailed target path
+/// mapped to a namespaced key (`ikigai:fs:<path>`) so several mounts/roots
+/// coexist in one origin's store. The jail and capability ACL have already run by
+/// the time these are called — only the storage primitive differs from native.
+///
+/// `localStorage` holds UTF-16 strings, so this backend is text-oriented: a write
+/// of non-UTF-8 bytes is refused (binary would need an encoding such as base64 —
+/// a later step). The REPL's `sink`/`source` are text, which is the intended use.
 #[cfg(target_family = "wasm")]
 mod backend {
     use super::*;
 
-    fn pending(op: &str) -> Error {
-        Error::Endpoint(format!(
-            "file {op}: the wasm localStorage backend is not yet implemented"
-        ))
+    /// The `localStorage` key for a jailed target path.
+    fn key(path: &Path) -> String {
+        format!("ikigai:fs:{}", path.display())
     }
 
-    pub(super) fn read(_path: &Path) -> Result<Vec<u8>> {
-        Err(pending("read"))
+    /// This origin's `localStorage`, or an error if it isn't available (no window,
+    /// or storage disabled).
+    fn storage() -> Result<web_sys::Storage> {
+        web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .ok_or_else(|| Error::Endpoint("localStorage is unavailable in this context".into()))
     }
-    pub(super) fn write(_path: &Path, _bytes: &[u8]) -> Result<()> {
-        Err(pending("write"))
+
+    pub(super) fn read(path: &Path) -> Result<Vec<u8>> {
+        let value = storage()?.get_item(&key(path)).map_err(|_| {
+            Error::Endpoint(format!("read {}: localStorage error", path.display()))
+        })?;
+        match value {
+            Some(text) => Ok(text.into_bytes()),
+            None => Err(Error::Endpoint(format!(
+                "read {}: no such item",
+                path.display()
+            ))),
+        }
     }
-    pub(super) fn exists(_path: &Path) -> Result<bool> {
-        Err(pending("exists"))
+
+    pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<()> {
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            Error::Endpoint(format!(
+                "write {}: the localStorage backend stores UTF-8 text (binary needs base64)",
+                path.display()
+            ))
+        })?;
+        storage()?.set_item(&key(path), text).map_err(|_| {
+            Error::Endpoint(format!("write {}: localStorage error (quota?)", path.display()))
+        })
     }
-    pub(super) fn delete(_path: &Path) -> Result<()> {
-        Err(pending("delete"))
+
+    pub(super) fn exists(path: &Path) -> Result<bool> {
+        Ok(storage()?
+            .get_item(&key(path))
+            .map_err(|_| Error::Endpoint(format!("exists {}: localStorage error", path.display())))?
+            .is_some())
+    }
+
+    pub(super) fn delete(path: &Path) -> Result<()> {
+        storage()?.remove_item(&key(path)).map_err(|_| {
+            Error::Endpoint(format!("delete {}: localStorage error", path.display()))
+        })
     }
 }
 
