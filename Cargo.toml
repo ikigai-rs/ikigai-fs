@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-fs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Capability-gated file/store ikigai module: jailed to a root with a default-deny path-ACL; SOURCE/SINK/EXISTS/DELETE. A cfg-gated backend links into native (std::fs) and wasm32 (browser localStorage) hosts from one crate."
@@ -14,9 +14,9 @@ categories = ["filesystem", "wasm"]
 [dependencies]
 # The released kernel, consumed from crates.io — the SAME version the hosts use,
 # so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
-# 0.1.7 is the first release carrying the `Capability` ACL surface this module
-# needs (`is_root`, `scopes`).
-ikigai-core = "0.1.7"
+# 0.1.9 carries the golden-thread surface the cacheable file mode needs:
+# `Representation::depends_on` and the kernel's auto-cut on a `Sink`.
+ikigai-core = "0.1.9"
 async-trait = "0.1"
 
 # Browser backend: localStorage via web-sys. wasm32-only — native hosts don't pull
