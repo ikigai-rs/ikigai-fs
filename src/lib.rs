@@ -43,8 +43,10 @@
 //! `Source` hands back a **string by default** (a known text media type from the
 //! extension, or `text/plain` when the bytes decode as UTF-8); pass `as` =
 //! `application/octet-stream` to get the raw **bytes** instead. `Sink` writes the
-//! `content` argument's bytes. Reads are **uncacheable** — a file is a live fact
-//! — until dependency-tracked invalidation (the "golden thread") lands.
+//! `content` argument's bytes. Reads are **uncacheable by default** — a file is a
+//! live fact — but a mount can opt into caching them under a **golden thread**
+//! ([`FileEndpoint::cacheable`] / [`cacheable_space`]): a `Sink`/`Delete` through
+//! the kernel then invalidates the cached read (requires `ikigai-core` ≥ 0.1.9).
 //!
 //! ## Platforms
 //!
@@ -80,15 +82,45 @@ pub fn space(root: impl Into<PathBuf>) -> EndpointSpace {
     )
 }
 
+/// Like [`space`], but **caches** `Source` reads under golden threads (see
+/// [`FileEndpoint::cacheable`]). A `Sink`/`Delete` through the kernel invalidates
+/// the cached read; suitable for a root written through ikigai. Requires a host
+/// kernel that auto-cuts on writes (`ikigai-core` ≥ 0.1.9).
+pub fn cacheable_space(root: impl Into<PathBuf>) -> EndpointSpace {
+    EndpointSpace::new().bind(
+        UriTemplate::parse(FILE_TEMPLATE).expect("FILE_TEMPLATE is a valid template"),
+        FileEndpoint::new(root).cacheable(),
+    )
+}
+
 /// A file endpoint jailed to a root directory, gated by the capability path-ACL.
 pub struct FileEndpoint {
     root: PathBuf,
+    cacheable: bool,
 }
 
 impl FileEndpoint {
     /// A file endpoint that will only ever serve paths within `root` (the jail).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        FileEndpoint { root: root.into() }
+        FileEndpoint {
+            root: root.into(),
+            cacheable: false,
+        }
+    }
+
+    /// Cache `Source` reads under a golden thread (opt-in).
+    ///
+    /// By default a file is a *live fact* — every read recomputes — so a change
+    /// made outside ikigai is always seen. Opt in to caching: each read is stored
+    /// under the thread named after the resource (its `urn:file:` IRI), and a
+    /// `Sink`/`Delete` through the kernel auto-cuts it, so writes invalidate
+    /// correctly. **Caveat:** out-of-band changes (an editor, another process) are
+    /// not seen until a kernel-mediated write — or an external watcher — cuts the
+    /// thread. Enable only where that staleness window is acceptable (e.g. a root
+    /// written through ikigai), until the watch policy lands.
+    pub fn cacheable(mut self) -> Self {
+        self.cacheable = true;
+        self
     }
 
     /// Resolve a request-relative path to a real path within the root, or deny.
@@ -151,8 +183,17 @@ impl Endpoint for FileEndpoint {
             Verb::Source => {
                 let bytes = backend_read(&target)?;
                 let repr_type = source_type(&target, &bytes, inv.inline_str("as").ok());
-                // Uncacheable: a file is a live fact (no `.cacheable()`).
-                Ok(Representation::new(repr_type, bytes))
+                let repr = Representation::new(repr_type, bytes);
+                if self.cacheable {
+                    // Cache under a golden thread named after the resource. A
+                    // `Sink`/`Delete` (kernel auto-cut) — or an external watcher —
+                    // invalidates it. All representations of the file (string, raw
+                    // bytes) share the thread, so one write invalidates them all.
+                    Ok(repr.cacheable().depends_on(inv.request.target.as_str()))
+                } else {
+                    // Default: a file is a live fact, recomputed every read.
+                    Ok(repr)
+                }
             }
             Verb::Sink => {
                 let content = inv.inline_arg("content")?;
@@ -378,9 +419,9 @@ mod backend {
     }
 
     pub(super) fn read(path: &Path) -> Result<Vec<u8>> {
-        let value = storage()?.get_item(&key(path)).map_err(|_| {
-            Error::Endpoint(format!("read {}: localStorage error", path.display()))
-        })?;
+        let value = storage()?
+            .get_item(&key(path))
+            .map_err(|_| Error::Endpoint(format!("read {}: localStorage error", path.display())))?;
         match value {
             Some(text) => Ok(text.into_bytes()),
             None => Err(Error::Endpoint(format!(
@@ -398,7 +439,10 @@ mod backend {
             ))
         })?;
         storage()?.set_item(&key(path), text).map_err(|_| {
-            Error::Endpoint(format!("write {}: localStorage error (quota?)", path.display()))
+            Error::Endpoint(format!(
+                "write {}: localStorage error (quota?)",
+                path.display()
+            ))
         })
     }
 
@@ -410,9 +454,9 @@ mod backend {
     }
 
     pub(super) fn delete(path: &Path) -> Result<()> {
-        storage()?.remove_item(&key(path)).map_err(|_| {
-            Error::Endpoint(format!("delete {}: localStorage error", path.display()))
-        })
+        storage()?
+            .remove_item(&key(path))
+            .map_err(|_| Error::Endpoint(format!("delete {}: localStorage error", path.display())))
     }
 }
 
@@ -649,6 +693,51 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(rep.bytes, b"hello from a space");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn default_space_does_not_cache_reads() {
+        use ikigai_core::Kernel;
+        use std::sync::Arc;
+        let root = temp_root();
+        std::fs::write(root.join("live.txt"), b"x").unwrap();
+        let kernel = Kernel::new(Arc::new(space(&root)));
+        let cap = Capability::root();
+        let source = Request::new(Verb::Source, Iri::parse("urn:file:live.txt").unwrap());
+        block_on(kernel.issue(source.clone(), &cap)).unwrap();
+        assert!(
+            !kernel.is_cached(&source),
+            "the default file mode is uncacheable (a live fact)"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cacheable_space_caches_reads_until_a_sink_cuts_them() {
+        use ikigai_core::Kernel;
+        use std::sync::Arc;
+        let root = temp_root();
+        std::fs::write(root.join("notes.txt"), b"v1").unwrap();
+        let kernel = Kernel::new(Arc::new(cacheable_space(&root)));
+        let cap = Capability::root();
+        let source = || Request::new(Verb::Source, Iri::parse("urn:file:notes.txt").unwrap());
+
+        // Read v1; the cacheable mode caches it under the `urn:file:notes.txt` thread.
+        assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v1");
+        assert!(kernel.is_cached(&source()), "cacheable source is cached");
+
+        // Write v2 through the kernel: the Sink auto-cuts `urn:file:notes.txt`.
+        let sink = Request::new(Verb::Sink, Iri::parse("urn:file:notes.txt").unwrap())
+            .with_arg("content", ikigai_core::ArgRef::Inline(b"v2".to_vec()));
+        block_on(kernel.issue(sink, &cap)).unwrap();
+        assert!(
+            !kernel.is_cached(&source()),
+            "the write invalidated the cached read"
+        );
+
+        // Read again: the cache recomputes and sees v2.
+        assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v2");
         std::fs::remove_dir_all(&root).ok();
     }
 }
