@@ -725,7 +725,10 @@ mod tests {
 
         // Read v1; the cacheable mode caches it under the `urn:file:notes.txt` thread.
         assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v1");
-        assert!(kernel.is_cached(&source(), &cap), "cacheable source is cached");
+        assert!(
+            kernel.is_cached(&source(), &cap),
+            "cacheable source is cached"
+        );
 
         // Write v2 through the kernel: the Sink auto-cuts `urn:file:notes.txt`.
         let sink = Request::new(Verb::Sink, Iri::parse("urn:file:notes.txt").unwrap())
