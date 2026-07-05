@@ -60,8 +60,8 @@ use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ArgSpec, Capability, Description, Endpoint, EndpointSpace, Error, Invocation, ReprType,
-    Representation, Result, UriTemplate, Verb,
+    ActionSpec, ArgSpec, Capability, Description, Endpoint, EndpointSpace, Error, Invocation,
+    ReprType, Representation, Result, UriTemplate, Verb,
 };
 
 /// The conventional grammar a host mounts this module at: `urn:file:{path}`,
@@ -247,6 +247,45 @@ impl Endpoint for FileEndpoint {
                     .summary("Requested representation type for Source (e.g. application/octet-stream for raw bytes)."),
             )
             .output("text/plain;charset=utf-8")
+            // Per-verb contracts: the path-ACL is parameterized
+            // (urn:cap:fs:<action>:<path>), so each action declares the wildcard
+            // form — "holds SOME grant under this prefix" — for selection; the
+            // exact target is still checked against the ACL at invoke time.
+            .action(
+                ActionSpec::new(Verb::Source)
+                    .summary("read a file within the jail")
+                    .requires("urn:cap:fs:read:*")
+                    .input(ArgSpec::new("path").summary("relative to the jailed root"))
+                    .input(
+                        ArgSpec::new("as")
+                            .summary("application/octet-stream for raw bytes")
+                            .one_of(["application/octet-stream"]),
+                    )
+                    .output("text/plain;charset=utf-8")
+                    .output("application/octet-stream"),
+            )
+            .action(
+                ActionSpec::new(Verb::Exists)
+                    .summary("test for a file (a read)")
+                    .requires("urn:cap:fs:read:*")
+                    .input(ArgSpec::new("path").summary("relative to the jailed root"))
+                    .output("text/plain;charset=utf-8"),
+            )
+            .action(
+                ActionSpec::new(Verb::Sink)
+                    .summary("write a file within the jail")
+                    .requires("urn:cap:fs:write:*")
+                    .input(ArgSpec::new("path").summary("relative to the jailed root"))
+                    .input(ArgSpec::new("content").summary("the bytes to write"))
+                    .output("text/plain;charset=utf-8"),
+            )
+            .action(
+                ActionSpec::new(Verb::Delete)
+                    .summary("delete a file within the jail")
+                    .requires("urn:cap:fs:delete:*")
+                    .input(ArgSpec::new("path").summary("relative to the jailed root"))
+                    .output("text/plain;charset=utf-8"),
+            )
     }
 }
 
