@@ -174,7 +174,9 @@ impl Endpoint for FileEndpoint {
             ))
         })?;
         if !cap_allows(inv.capability, action, &target) {
-            return Err(Error::Endpoint(format!(
+            // Typed `Denied` — a permanent authority failure the trace, manifold,
+            // and wire recognize as a 403-equivalent without sniffing message text.
+            return Err(Error::Denied(format!(
                 "capability does not grant `{action}` on `{rel}`"
             )));
         }
@@ -616,7 +618,10 @@ mod tests {
         std::fs::write(root.join("ok.txt"), b"yes").unwrap();
         let ep = FileEndpoint::new(&root);
         let err = invoke(&ep, Verb::Source, "ok.txt", &cap(&[]), &[]).unwrap_err();
-        assert!(matches!(err, Error::Endpoint(_)));
+        // A capability denial is the typed, permanent `Denied` — never a generic
+        // `Endpoint` string, and never transient (re-issuing won't change the answer).
+        assert!(matches!(err, Error::Denied(_)));
+        assert!(!err.is_transient());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -626,7 +631,8 @@ mod tests {
         let ep = FileEndpoint::new(&root);
         let c = cap(&[&read_scope(&root)]);
         let err = invoke(&ep, Verb::Sink, "new.txt", &c, &[("content", b"x")]).unwrap_err();
-        assert!(matches!(err, Error::Endpoint(_)));
+        assert!(matches!(err, Error::Denied(_)));
+        assert!(!err.is_transient());
         assert!(!root.join("new.txt").exists());
         std::fs::remove_dir_all(&root).ok();
     }

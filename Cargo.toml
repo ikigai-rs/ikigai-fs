@@ -16,7 +16,7 @@ categories = ["filesystem", "wasm"]
 # so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
 # 0.1.9 carries the golden-thread surface the cacheable file mode needs:
 # `Representation::depends_on` and the kernel's auto-cut on a `Sink`.
-ikigai-core = "0.1.35" # ActionSpec (per-verb contracts)
+ikigai-core = "0.1.46" # Error::Denied (typed capability-denial variant)
 async-trait = "0.1"
 
 # Browser backend: localStorage via web-sys. wasm32-only — native hosts don't pull
