@@ -10,8 +10,9 @@
 //!
 //! 1. **The jail (structural, set at mount time).** [`FileEndpoint::new`] is
 //!    handed a `root` directory and will never serve a path outside it: `..` and
-//!    absolute segments are rejected, and an existing target's canonical path
-//!    must still sit within the canonical root (symlink-safe). Fixed at mount —
+//!    absolute segments are rejected, and the target's deepest existing ancestor
+//!    must canonicalize to within the canonical root — so a symlink component
+//!    cannot escape even when the leaf is a not-yet-created file. Fixed at mount —
 //!    even a `root` capability cannot escape it.
 //! 2. **The capability path-ACL (dynamic, per request).** The invocation's
 //!    [`Capability`] must grant the request's action for the resolved path. A
@@ -139,14 +140,33 @@ impl FileEndpoint {
             }
         }
         let target = self.root.join(rel);
-        // Symlink-safe containment check when the target already exists.
-        if let (Ok(canonical_root), Ok(canonical_target)) =
-            (self.root.canonicalize(), target.canonicalize())
-        {
-            if !canonical_target.starts_with(&canonical_root) {
-                return Err(Error::Endpoint(
-                    "resolved path escapes the endpoint root".to_string(),
-                ));
+        // Symlink-safe containment. `canonicalize` resolves every symlink but
+        // requires the whole path to exist, so we cannot canonicalize `target`
+        // itself when it names a not-yet-created file. Instead we canonicalize
+        // the deepest *existing* ancestor of `target` and require it to sit
+        // within the canonical root. This closes the escape where a new path is
+        // created through a pre-planted symlink component (`link/newfile`):
+        // canonicalizing the ancestor `root/link` follows the link out of the
+        // jail and is caught here, before `create_dir_all` + `write` would
+        // otherwise follow it. (`..` segments are already rejected above, so
+        // walking `parent()` never climbs above the lexical target.)
+        if let Ok(canonical_root) = self.root.canonicalize() {
+            let mut ancestor = target.as_path();
+            let canonical_ancestor = loop {
+                match ancestor.canonicalize() {
+                    Ok(c) => break Some(c),
+                    Err(_) => match ancestor.parent() {
+                        Some(parent) => ancestor = parent,
+                        None => break None,
+                    },
+                }
+            };
+            if let Some(canonical_ancestor) = canonical_ancestor {
+                if !canonical_ancestor.starts_with(&canonical_root) {
+                    return Err(Error::Endpoint(
+                        "resolved path escapes the endpoint root".to_string(),
+                    ));
+                }
             }
         }
         Ok(target)
@@ -700,6 +720,33 @@ mod tests {
         let err = invoke(&ep, Verb::Source, "../escape", &Capability::root(), &[]).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument { .. }));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_component_cannot_create_a_file_outside_the_jail() {
+        // A new file created *through* a pre-planted symlink must be rejected by
+        // the jail, even though the leaf does not exist yet (so `canonicalize`
+        // on the target itself fails). Escape would otherwise let
+        // `create_dir_all` + `write` follow the link out of the root.
+        let root = temp_root();
+        let outside = temp_root(); // a distinct dir, not under `root`
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let ep = FileEndpoint::new(&root);
+        // Even a root capability (all path-ACLs granted) must not escape.
+        let err = invoke(
+            &ep,
+            Verb::Sink,
+            "link/newfile",
+            &Capability::root(),
+            &[("content", b"pwned")],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Endpoint(_)));
+        // Nothing was written outside the jail.
+        assert!(!outside.join("newfile").exists());
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
