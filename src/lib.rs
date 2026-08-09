@@ -258,7 +258,8 @@ impl Endpoint for FileEndpoint {
             .verb(Verb::Meta)
             .input(
                 ArgSpec::new("path")
-                    .summary("Path relative to the endpoint root (no `..`, no absolute paths)."),
+                    .summary("Path relative to the endpoint root (no `..`, no absolute paths).")
+                    .binding(),
             )
             .input(
                 ArgSpec::new("content")
@@ -277,7 +278,7 @@ impl Endpoint for FileEndpoint {
                 ActionSpec::new(Verb::Source)
                     .summary("read a file within the jail")
                     .requires("urn:cap:fs:read:*")
-                    .input(ArgSpec::new("path").summary("relative to the jailed root"))
+                    .input(ArgSpec::new("path").summary("relative to the jailed root").binding())
                     .input(
                         ArgSpec::new("as")
                             .summary("application/octet-stream for raw bytes")
@@ -290,14 +291,14 @@ impl Endpoint for FileEndpoint {
                 ActionSpec::new(Verb::Exists)
                     .summary("test for a file (a read)")
                     .requires("urn:cap:fs:read:*")
-                    .input(ArgSpec::new("path").summary("relative to the jailed root"))
+                    .input(ArgSpec::new("path").summary("relative to the jailed root").binding())
                     .output("text/plain;charset=utf-8"),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("write a file within the jail")
                     .requires("urn:cap:fs:write:*")
-                    .input(ArgSpec::new("path").summary("relative to the jailed root"))
+                    .input(ArgSpec::new("path").summary("relative to the jailed root").binding())
                     .input(ArgSpec::new("content").summary("the bytes to write"))
                     .output("text/plain;charset=utf-8"),
             )
@@ -305,7 +306,7 @@ impl Endpoint for FileEndpoint {
                 ActionSpec::new(Verb::Delete)
                     .summary("delete a file within the jail")
                     .requires("urn:cap:fs:delete:*")
-                    .input(ArgSpec::new("path").summary("relative to the jailed root"))
+                    .input(ArgSpec::new("path").summary("relative to the jailed root").binding())
                     .output("text/plain;charset=utf-8"),
             )
     }
@@ -770,6 +771,38 @@ mod tests {
         assert!(invoke(&ep, Verb::Delete, "gone.txt", &deleter, &[]).is_ok());
         assert!(!root.join("gone.txt").exists());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn describe_marks_path_as_a_grammar_binding_on_every_action() {
+        use ikigai_core::InputSource;
+        let desc = FileEndpoint::new("/tmp").describe();
+
+        // `path` is `{path}` in `urn:file:{path}` — a Binding-source input. The
+        // manifold gate (core #84) offers a template action only when every
+        // template variable is a declared Binding; without this, the whole
+        // grammar stays out of the manifold/catalog/MCP.
+        let flat_path = desc.inputs.iter().find(|a| a.name == "path").unwrap();
+        assert_eq!(flat_path.source, InputSource::Binding);
+
+        assert_eq!(desc.actions.len(), 4, "four per-verb ActionSpecs");
+        for action in &desc.actions {
+            let path = action
+                .inputs
+                .iter()
+                .find(|a| a.name == "path")
+                .unwrap_or_else(|| panic!("{:?} action declares `path`", action.verb));
+            assert_eq!(
+                path.source,
+                InputSource::Binding,
+                "{:?} action's `path` is a grammar binding",
+                action.verb
+            );
+            // The by-value args stay Arguments — only the template variable binds.
+            for other in action.inputs.iter().filter(|a| a.name != "path") {
+                assert_eq!(other.source, InputSource::Argument, "{}", other.name);
+            }
+        }
     }
 
     #[test]
