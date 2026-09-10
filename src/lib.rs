@@ -44,10 +44,14 @@
 //! `Source` hands back a **string by default** (a known text media type from the
 //! extension, or `text/plain` when the bytes decode as UTF-8); pass `as` =
 //! `application/octet-stream` to get the raw **bytes** instead. `Sink` writes the
-//! `content` argument's bytes. Reads are **uncacheable by default** — a file is a
-//! live fact — but a mount can opt into caching them under a **golden thread**
-//! ([`FileEndpoint::cacheable`] / [`cacheable_space`]): a `Sink`/`Delete` through
-//! the kernel then invalidates the cached read (requires `ikigai-core` ≥ 0.1.9).
+//! `content` argument's bytes. Reads (and `Exists` answers) are **uncacheable by
+//! default** — a file is a live fact — but a mount can opt into caching them
+//! under a **golden thread** ([`FileEndpoint::cacheable`] / [`cacheable_space`]):
+//! a `Sink`/`Delete` through the kernel then invalidates the cached read
+//! (requires `ikigai-core` ≥ 0.1.9).
+//!
+//! The module passes `ikigai-conformance` (`tests/conformance.rs`) on both
+//! mounts, with no opt-outs.
 //!
 //! ## Platforms
 //!
@@ -70,6 +74,12 @@ use ikigai_core::{
 /// `path` binding (so the file's *identity* is the request, not an argument).
 pub const FILE_TEMPLATE: &str = "urn:file:{path}";
 
+/// The datatype every input of this module carries: a root-relative path, a
+/// media type, and the bytes to write all arrive as strings on the wire and in
+/// an agent's tool call. (The bytes are not base64 — `content` is the payload
+/// itself, which the wasm backend additionally requires to be UTF-8.)
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+
 /// Mount the file module at its conventional grammar (`urn:file:{path}`), jailed
 /// to `root`.
 ///
@@ -83,9 +93,9 @@ pub fn space(root: impl Into<PathBuf>) -> EndpointSpace {
     )
 }
 
-/// Like [`space`], but **caches** `Source` reads under golden threads (see
-/// [`FileEndpoint::cacheable`]). A `Sink`/`Delete` through the kernel invalidates
-/// the cached read; suitable for a root written through ikigai. Requires a host
+/// Like [`space`], but **caches** `Source` reads and `Exists` answers under golden
+/// threads (see [`FileEndpoint::cacheable`]). A `Sink`/`Delete` through the kernel
+/// invalidates them; suitable for a root written through ikigai. Requires a host
 /// kernel that auto-cuts on writes (`ikigai-core` ≥ 0.1.9).
 pub fn cacheable_space(root: impl Into<PathBuf>) -> EndpointSpace {
     EndpointSpace::new().bind(
@@ -109,16 +119,17 @@ impl FileEndpoint {
         }
     }
 
-    /// Cache `Source` reads under a golden thread (opt-in).
+    /// Cache `Source` reads and `Exists` answers under a golden thread (opt-in).
     ///
     /// By default a file is a *live fact* — every read recomputes — so a change
-    /// made outside ikigai is always seen. Opt in to caching: each read is stored
-    /// under the thread named after the resource (its `urn:file:` IRI), and a
-    /// `Sink`/`Delete` through the kernel auto-cuts it, so writes invalidate
-    /// correctly. **Caveat:** out-of-band changes (an editor, another process) are
-    /// not seen until a kernel-mediated write — or an external watcher — cuts the
-    /// thread. Enable only where that staleness window is acceptable (e.g. a root
-    /// written through ikigai), until the watch policy lands.
+    /// made outside ikigai is always seen. Opt in to caching: each read (and each
+    /// existence check) is stored under the thread named after the resource (its
+    /// `urn:file:` IRI), and a `Sink`/`Delete` through the kernel auto-cuts it,
+    /// so writes invalidate correctly. **Caveat:** out-of-band changes (an
+    /// editor, another process) are not seen until a kernel-mediated write — or
+    /// an external watcher — cuts the thread. Enable only where that staleness
+    /// window is acceptable (e.g. a root written through ikigai), until the watch
+    /// policy lands.
     pub fn cacheable(mut self) -> Self {
         self.cacheable = true;
         self
@@ -224,7 +235,18 @@ impl Endpoint for FileEndpoint {
             }
             Verb::Exists => {
                 let present = backend_exists(&target)?;
-                Ok(ack(if present { "true" } else { "false" }.to_string()))
+                let repr = ack(if present { "true" } else { "false" }.to_string());
+                if self.cacheable {
+                    // The same thread as the read: an existence answer is a
+                    // representation of the file too, and the `Sink`/`Delete`
+                    // that changes it is the one that cuts the thread. Without
+                    // this the cacheable mode kept one representation live and
+                    // one cached — the conformance suite's "declared cacheable
+                    // but returned uncacheable" finding.
+                    Ok(repr.cacheable().depends_on(inv.request.target.as_str()))
+                } else {
+                    Ok(repr)
+                }
             }
             Verb::Delete => {
                 backend_delete(&target)?;
@@ -259,15 +281,20 @@ impl Endpoint for FileEndpoint {
             .input(
                 ArgSpec::new("path")
                     .summary("Path relative to the endpoint root (no `..`, no absolute paths).")
+                    .class(XSD_STRING)
                     .binding(),
             )
             .input(
                 ArgSpec::new("content")
-                    .summary("Bytes to write (Sink only)."),
+                    .summary("Bytes to write (Sink only).")
+                    .class(XSD_STRING)
+                    .optional(),
             )
             .input(
                 ArgSpec::new("as")
-                    .summary("Requested representation type for Source (e.g. application/octet-stream for raw bytes)."),
+                    .summary("Requested representation type for Source (e.g. application/octet-stream for raw bytes).")
+                    .class(XSD_STRING)
+                    .optional(),
             )
             .output("text/plain;charset=utf-8")
             // Per-verb contracts: the path-ACL is parameterized
@@ -278,11 +305,21 @@ impl Endpoint for FileEndpoint {
                 ActionSpec::new(Verb::Source)
                     .summary("read a file within the jail")
                     .requires("urn:cap:fs:read:*")
-                    .input(ArgSpec::new("path").summary("relative to the jailed root").binding())
+                    .input(
+                        ArgSpec::new("path")
+                            .summary("relative to the jailed root")
+                            .class(XSD_STRING)
+                            .binding(),
+                    )
                     .input(
                         ArgSpec::new("as")
                             .summary("application/octet-stream for raw bytes")
-                            .one_of(["application/octet-stream"]),
+                            .class(XSD_STRING)
+                            .one_of(["application/octet-stream"])
+                            // Omitted: a string by default. No `default_value`,
+                            // because the default is not one media type but
+                            // "the extension's, else text/plain when UTF-8".
+                            .optional(),
                     )
                     .output("text/plain;charset=utf-8")
                     .output("application/octet-stream"),
@@ -291,22 +328,41 @@ impl Endpoint for FileEndpoint {
                 ActionSpec::new(Verb::Exists)
                     .summary("test for a file (a read)")
                     .requires("urn:cap:fs:read:*")
-                    .input(ArgSpec::new("path").summary("relative to the jailed root").binding())
+                    .input(
+                        ArgSpec::new("path")
+                            .summary("relative to the jailed root")
+                            .class(XSD_STRING)
+                            .binding(),
+                    )
                     .output("text/plain;charset=utf-8"),
             )
             .action(
                 ActionSpec::new(Verb::Sink)
                     .summary("write a file within the jail")
                     .requires("urn:cap:fs:write:*")
-                    .input(ArgSpec::new("path").summary("relative to the jailed root").binding())
-                    .input(ArgSpec::new("content").summary("the bytes to write"))
+                    .input(
+                        ArgSpec::new("path")
+                            .summary("relative to the jailed root")
+                            .class(XSD_STRING)
+                            .binding(),
+                    )
+                    .input(
+                        ArgSpec::new("content")
+                            .summary("the bytes to write")
+                            .class(XSD_STRING),
+                    )
                     .output("text/plain;charset=utf-8"),
             )
             .action(
                 ActionSpec::new(Verb::Delete)
                     .summary("delete a file within the jail")
                     .requires("urn:cap:fs:delete:*")
-                    .input(ArgSpec::new("path").summary("relative to the jailed root").binding())
+                    .input(
+                        ArgSpec::new("path")
+                            .summary("relative to the jailed root")
+                            .class(XSD_STRING)
+                            .binding(),
+                    )
                     .output("text/plain;charset=utf-8"),
             )
     }
@@ -866,6 +922,45 @@ mod tests {
 
         // Read again: the cache recomputes and sees v2.
         assert_eq!(block_on(kernel.issue(source(), &cap)).unwrap().bytes, b"v2");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cacheable_space_caches_exists_under_the_same_thread_as_the_read() {
+        use ikigai_core::Kernel;
+        use std::sync::Arc;
+        let root = temp_root();
+        let kernel = Kernel::new(Arc::new(cacheable_space(&root)));
+        let cap = Capability::root();
+        let exists = || Request::new(Verb::Exists, Iri::parse("urn:file:later.txt").unwrap());
+
+        // Not yet there: "false", cached under the `urn:file:later.txt` thread.
+        assert_eq!(
+            block_on(kernel.issue(exists(), &cap)).unwrap().bytes,
+            b"false"
+        );
+        assert!(
+            kernel.is_cached(&exists(), &cap),
+            "cacheable mode caches the existence answer too"
+        );
+
+        // Creating it through the kernel cuts the thread; the answer flips.
+        let sink = Request::new(Verb::Sink, Iri::parse("urn:file:later.txt").unwrap())
+            .with_arg("content", ikigai_core::ArgRef::Inline(b"now".to_vec()));
+        block_on(kernel.issue(sink, &cap)).unwrap();
+        assert!(
+            !kernel.is_cached(&exists(), &cap),
+            "the write invalidated it"
+        );
+        assert_eq!(
+            block_on(kernel.issue(exists(), &cap)).unwrap().bytes,
+            b"true"
+        );
+
+        // The default mount never caches it: a file is a live fact.
+        let live = Kernel::new(Arc::new(space(&root)));
+        block_on(live.issue(exists(), &cap)).unwrap();
+        assert!(!live.is_cached(&exists(), &cap));
         std::fs::remove_dir_all(&root).ok();
     }
 }
