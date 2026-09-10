@@ -53,12 +53,33 @@ module does the path-aware matching.
 - `Sink` — write the `content` argument's bytes.
 - `Exists` / `Delete` — existence check (a read) and removal (a delete).
 
+Every input is typed (`xsd:string`) and `path` is declared as the `{path}`
+binding of the grammar on every action, so the whole `urn:file:*` grammar is
+selectable from the action manifold and projects as one well-typed MCP tool.
+
 ## Mounting
 
 ```rust
 let kernel = Kernel::new(Arc::new(ikigai_fs::space("/Users/me/workspace")));
 // resolve `urn:file:notes.txt` under a capability scoped within the root
 ```
+
+`cacheable_space` is the opt-in alternative: `Source` reads **and** `Exists`
+answers are cached under a golden thread named after the resource, and a
+`Sink`/`Delete` through the kernel cuts it. Out-of-band changes are not seen
+until something cuts the thread, so use it for a root written through ikigai.
+
+## Conformance
+
+The module **passes
+[`ikigai-conformance`](https://github.com/ikigai-rs/ikigai-conformance)** with
+no opt-outs, on both mounts: `tests/conformance.rs` builds a jail over a fresh
+temporary directory (the suite fires `Sink`, so the kernel under test is a
+fixture) and runs every check — ArgSpec completeness, template drivability,
+declared = enforced via the path-ACL floor, cacheability, pipeline citizenship,
+naming. The cacheable mount is declared `cacheable` there and held to it; the
+endpoint is deliberately **not** declared `pure` — its results depend on the
+file — so a cached read with an empty golden-thread set would fail the test.
 
 ## Platforms
 
