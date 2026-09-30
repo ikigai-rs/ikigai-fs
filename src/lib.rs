@@ -473,6 +473,11 @@ fn media_type_for(path: &Path) -> ReprType {
         Some("json") => "application/json",
         Some("jsonld") => "application/ld+json",
         Some("html") => "text/html",
+        // A declared arrangement written as an s-expression (ikigai-sexpr's arrangement surface).
+        // Deliberately NOT `text/x-sexpr`: ikigai-sexpr already has a lossless `text/x-sexpr →
+        // text/turtle` transreptor (the code-graph profile), so a lossless-only selector over that
+        // type would hand the arrangement builder a list graph instead of an arrangement.
+        Some("arrangement") => "text/x-ikigai-arrangement",
         _ => "application/octet-stream",
     };
     ReprType::new(media)
@@ -597,6 +602,18 @@ mod tests {
     use futures::executor::block_on;
     use ikigai_core::{Bindings, Iri, Request};
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn an_arrangement_file_is_its_own_media_type_not_a_generic_sexpr() {
+        assert_eq!(
+            media_type_for(Path::new("game.arrangement")).media_type,
+            "text/x-ikigai-arrangement"
+        );
+        assert_eq!(
+            source_type(Path::new("dir/game.arrangement"), b"(fallback)", None).media_type,
+            "text/x-ikigai-arrangement"
+        );
+    }
 
     fn temp_root() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
