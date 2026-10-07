@@ -19,6 +19,14 @@ categories = ["filesystem", "wasm"]
 ikigai-core = "0.1.46" # Error::Denied (typed capability-denial variant)
 async-trait = "0.1"
 
+# Native backend: the jail resolves every name with `openat` relative to a handle on
+# its parent (`O_NOFOLLOW`, `O_DIRECTORY`), reads the directory to learn a name's
+# on-disk spelling, and reads/writes on the handle the walk produced. `rustix` is the
+# safe wrapper over exactly those calls (no `unsafe` here). 1.0 carries every call used
+# (`openat`, `statat`, `mkdirat`, `unlinkat`, `fstat`, `ftruncate`, `Dir::read_from`).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.0", features = ["fs"] }
+
 # Browser backend: localStorage via web-sys. wasm32-only — native hosts don't pull
 # it, so the `std::fs` path stays dependency-light.
 [target.'cfg(target_family = "wasm")'.dependencies]

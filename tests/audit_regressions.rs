@@ -108,7 +108,10 @@ fn b1_a_dangling_symlink_leaf_cannot_create_a_file_outside_the_jail() {
     let escaped = outside.join("planted").exists();
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&outside).ok();
-    assert!(!escaped, "jail escape through a dangling link: {result:?} / {root_result:?}");
+    assert!(
+        !escaped,
+        "jail escape through a dangling link: {result:?} / {root_result:?}"
+    );
     assert!(
         matches!(result, Err(Error::InvalidArgument { .. })),
         "a link is refused, not followed: {result:?}"
@@ -130,7 +133,11 @@ fn b2a_a_case_variant_cannot_bypass_a_deny() {
     let got = source(&k, "SECRET/k.txt", &cap);
     let under_root = source(&k, "SECRET/k.txt", &Capability::root());
     std::fs::remove_dir_all(&root).ok();
-    assert!(got.is_err(), "deny bypassed by a case variant: {}", lossy(&got));
+    assert!(
+        got.is_err(),
+        "deny bypassed by a case variant: {}",
+        lossy(&got)
+    );
     // Not merely denied: the endpoint serves a file under its on-disk spelling only.
     assert!(
         matches!(under_root, Err(Error::InvalidArgument { .. })),
@@ -151,7 +158,11 @@ fn b2b_an_in_jail_symlink_cannot_bypass_a_deny() {
     let via_link = source(&k, "public/k.txt", &cap);
     std::fs::remove_dir_all(&root).ok();
     assert!(direct.is_err(), "sanity: the deny holds on the direct path");
-    assert!(via_link.is_err(), "deny bypassed through an in-jail link: {}", lossy(&via_link));
+    assert!(
+        via_link.is_err(),
+        "deny bypassed through an in-jail link: {}",
+        lossy(&via_link)
+    );
 }
 
 /// B2c. The same root cause on an ALLOWLIST and a WRITE: a capability for `<root>/public`
@@ -164,12 +175,18 @@ fn b2c_an_allowlisted_subtree_cannot_write_outside_itself_through_a_link() {
     std::fs::create_dir_all(root.join("private")).unwrap();
     std::os::unix::fs::symlink("../private", root.join("public/up")).unwrap();
     let k = kernel(&root);
-    let cap = Capability::scoped([format!("urn:cap:fs:write:{}", root.join("public").display())]);
+    let cap = Capability::scoped([format!(
+        "urn:cap:fs:write:{}",
+        root.join("public").display()
+    )]);
     let direct = sink(&k, "private/direct.txt", b"x", &cap);
     let via_link = sink(&k, "public/up/planted.txt", b"x", &cap);
     let wrote = root.join("private/planted.txt").exists();
     std::fs::remove_dir_all(&root).ok();
-    assert!(direct.is_err(), "sanity: the allowlist refuses private/ directly");
+    assert!(
+        direct.is_err(),
+        "sanity: the allowlist refuses private/ directly"
+    );
     assert!(!wrote, "allowlist bypassed through a link: {via_link:?}");
 }
 
@@ -227,15 +244,31 @@ fn f3_a_root_that_cannot_be_opened_fails_closed() {
     let parent = temp_dir("f3");
     let missing = parent.join("no-such-root");
     let k = kernel(&missing);
-    let wrote = sink(&k, "x.txt", b"written under a missing root", &Capability::root());
+    let wrote = sink(
+        &k,
+        "x.txt",
+        b"written under a missing root",
+        &Capability::root(),
+    );
     let read = source(&k, "x.txt", &Capability::root());
     let there = exists(&k, "x.txt", &Capability::root());
     let created = missing.exists();
     std::fs::remove_dir_all(&parent).ok();
-    assert!(wrote.is_err(), "Sink under a missing root must fail closed: {wrote:?}");
+    assert!(
+        wrote.is_err(),
+        "Sink under a missing root must fail closed: {wrote:?}"
+    );
     assert!(!created, "the endpoint created its own jail root");
-    assert!(read.is_err(), "Source under a missing root: {}", lossy(&read));
-    assert!(there.is_err(), "Exists under a missing root: {}", lossy(&there));
+    assert!(
+        read.is_err(),
+        "Source under a missing root: {}",
+        lossy(&read)
+    );
+    assert!(
+        there.is_err(),
+        "Exists under a missing root: {}",
+        lossy(&there)
+    );
 }
 
 // --- C: one file, one thread ----------------------------------------------------------
@@ -268,7 +301,11 @@ fn b4_f1_no_alias_of_a_file_serves_a_stale_read_after_a_write() {
     assert_eq!(source(&k, "notes.txt", &cap).unwrap(), b"v1");
     let _ = source(&k, "./notes.txt", &cap);
     sink(&k, "notes.txt", b"v2", &cap).unwrap();
-    fresh_or_refused(source(&k, "./notes.txt", &cap), b"v2", "read ./notes.txt after Sink notes.txt");
+    fresh_or_refused(
+        source(&k, "./notes.txt", &cap),
+        b"v2",
+        "read ./notes.txt after Sink notes.txt",
+    );
 
     // The reverse: a write through the alias must not leave the canonical read stale.
     assert_eq!(source(&k, "notes.txt", &cap).unwrap(), b"v2");
@@ -352,7 +389,8 @@ fn b6_an_undeclared_as_is_refused_not_relabeled() {
     let root = temp_dir("b6");
     std::fs::write(root.join("upload.txt"), b"<script>alert(1)</script>").unwrap();
     let k = kernel(&root);
-    let req = request(Verb::Source, "upload.txt").with_arg("as", ArgRef::Inline(b"text/html".to_vec()));
+    let req =
+        request(Verb::Source, "upload.txt").with_arg("as", ArgRef::Inline(b"text/html".to_vec()));
     let got = block_on(k.issue(req, &Capability::root()));
     let raw = request(Verb::Source, "upload.txt")
         .with_arg("as", ArgRef::Inline(b"application/octet-stream".to_vec()));
@@ -362,7 +400,10 @@ fn b6_an_undeclared_as_is_refused_not_relabeled() {
         Err(Error::InvalidArgument { name, .. }) => assert_eq!(name, "as"),
         other => panic!("an undeclared `as` must be refused: {other:?}"),
     }
-    assert_eq!(declared.unwrap().repr_type.media_type, "application/octet-stream");
+    assert_eq!(
+        declared.unwrap().repr_type.media_type,
+        "application/octet-stream"
+    );
 }
 
 /// F5. A CRLF in `as` reached the representation's media type verbatim, and an HTTP
@@ -396,8 +437,16 @@ fn b8_an_absent_file_is_typed_not_found() {
     let deeper = source(&k, "no/such/dir/absent.txt", &cap);
     let gone = delete(&k, "absent.txt", &cap);
     std::fs::remove_dir_all(&root).ok();
-    assert!(matches!(read, Err(Error::NotFound(_))), "Source: {}", lossy(&read));
-    assert!(matches!(deeper, Err(Error::NotFound(_))), "Source deeper: {}", lossy(&deeper));
+    assert!(
+        matches!(read, Err(Error::NotFound(_))),
+        "Source: {}",
+        lossy(&read)
+    );
+    assert!(
+        matches!(deeper, Err(Error::NotFound(_))),
+        "Source deeper: {}",
+        lossy(&deeper)
+    );
     assert!(matches!(gone, Err(Error::NotFound(_))), "Delete: {gone:?}");
 }
 
@@ -450,7 +499,11 @@ fn b9_exists_surfaces_a_failed_check() {
         eprintln!("running as a user that ignores mode bits: B9 is not reachable here");
         return;
     }
-    assert!(got.is_err(), "Exists must surface the failed check, not answer: {}", lossy(&got));
+    assert!(
+        got.is_err(),
+        "Exists must surface the failed check, not answer: {}",
+        lossy(&got)
+    );
 }
 
 // --- ledger #230: a scope matches the jail under either spelling of its root ----------
@@ -467,7 +520,11 @@ fn a_scope_matches_the_jail_under_its_canonical_spelling() {
     let secret = source(&k, "secret/k.txt", &cap);
     std::fs::remove_dir_all(&root).ok();
     assert_eq!(open.unwrap(), b"public");
-    assert!(matches!(secret, Err(Error::Denied(_))), "{}", lossy(&secret));
+    assert!(
+        matches!(secret, Err(Error::Denied(_))),
+        "{}",
+        lossy(&secret)
+    );
 }
 
 // --- B3: the known gap (ledger #858, core's) -----------------------------------------
@@ -484,9 +541,21 @@ fn known_gap_858_a_dropped_deny_scope_widens_access() {
     let parent_read = source(&k, "secret/k.txt", &parent);
     let child = parent.attenuate([read_rule(&root)]);
     let attenuated = source(&k, "secret/k.txt", &child);
-    let clamped = source(&k, "secret/k.txt", &parent.clamp(&Capability::scoped([read_rule(&root)])));
+    let clamped = source(
+        &k,
+        "secret/k.txt",
+        &parent.clamp(&Capability::scoped([read_rule(&root)])),
+    );
     std::fs::remove_dir_all(&root).ok();
     assert!(parent_read.is_err(), "sanity: the parent denies");
-    assert_eq!(attenuated.unwrap(), b"PRIVATE", "gap #858 (attenuate) closed? flip this test");
-    assert_eq!(clamped.unwrap(), b"PRIVATE", "gap #858 (clamp) closed? flip this test");
+    assert_eq!(
+        attenuated.unwrap(),
+        b"PRIVATE",
+        "gap #858 (attenuate) closed? flip this test"
+    );
+    assert_eq!(
+        clamped.unwrap(),
+        b"PRIVATE",
+        "gap #858 (clamp) closed? flip this test"
+    );
 }
