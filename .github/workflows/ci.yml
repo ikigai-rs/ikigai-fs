@@ -10,3 +10,6 @@ jobs:
     uses: ikigai-rs/.github/.github/workflows/rust.yml@main
     with:
       wasm-lib: true
+      # The jail's case- and normalization-folding refusals only exist on a folding
+      # volume (macOS's default APFS); Linux CI skips those tests.
+      macos: true
