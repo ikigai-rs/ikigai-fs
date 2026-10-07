@@ -146,7 +146,7 @@ One crate, a `cfg`-gated backend.
 - **Any other native platform** (Windows) has no confined backend yet and
   **refuses every request** rather than serve one unconfined.
 
-## Unreleased
+## 0.1.8 (2026-10-07)
 
 **Version call: 0.1.8 (a patch), not 0.2.0.** No public API changes (the same
 `space`, `cacheable_space`, `FileEndpoint`, `FILE_TEMPLATE`), and these are security
