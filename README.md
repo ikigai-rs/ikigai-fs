@@ -75,16 +75,11 @@ which can only over-deny; an allow is never widened that way. These are
 owner-minted rule sets — the flat-scope `Capability` is untouched and this module
 does the path-aware matching.
 
-> ⚠ **Known gap: a `-path` deny does not survive attenuation or a transport
-> clamp.** A deny is an ordinary scope, and core's `Capability::attenuate` (keep a
-> subset) and `Capability::clamp` (intersect) may drop it — and dropping an
-> exclusion *widens* access. A delegate attenuated to `{read:/ws}` from
-> `{read:/ws, read:-/ws/secret}` reads `secret`, and so does a peer clamped to a
-> ceiling that carries the deny. Until core gives exclusions a form that is never
-> dropped (ledger #858), express a boundary that must survive delegation or the
-> wire as an **allowlist** (grant the subtrees, deny nothing), or jail the
-> delegate to its own root. `tests/audit_regressions.rs` pins today's behavior as
-> `known_gap_858_…`, so the day it changes the test says so.
+> **A `-path` deny survives attenuation and a transport clamp** (since ikigai-core 0.1.86,
+> ledger #858). A deny is a deny-shaped scope (`ikigai_core::is_deny_scope`), and core's
+> `attenuate` and `clamp` keep every deny either side holds, so a delegate attenuated to
+> `{read:/ws}` from `{read:/ws, read:-/ws/secret}` still cannot read `secret`.
+> `tests/audit_regressions.rs` pins it (`b3_a_deny_survives_attenuation_and_clamp`).
 
 ## Verbs
 

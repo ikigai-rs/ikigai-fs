@@ -527,15 +527,14 @@ fn a_scope_matches_the_jail_under_its_canonical_spelling() {
     );
 }
 
-// --- B3: the known gap (ledger #858, core's) -----------------------------------------
+// --- B3: a deny survives delegation (ledger #858, fixed in core 0.1.86) --------------
 
-/// **KNOWN GAP, pinned on purpose.** A deny rule is an ordinary scope, and core's
-/// `attenuate` (keep a subset) and `clamp` (intersect) may drop it, which WIDENS access:
-/// a delegate or a clamped peer reads what its parent could not. Fixing it needs a core
-/// concept (an exclusion that attenuation and clamps never drop), ledger #858. This test
-/// asserts today's behavior so that the day core seals exclusions it FAILS — flip it then.
+/// A deny rule is a deny-shaped scope, and since ikigai-core 0.1.86 `attenuate` and
+/// `clamp` keep every deny either side holds (`is_deny_scope`). This was pinned as a
+/// KNOWN GAP until then: a delegate attenuated to `{read:/root}` from
+/// `{read:/root, read:-/root/secret}`, or a peer clamped the same way, read the secret.
 #[test]
-fn known_gap_858_a_dropped_deny_scope_widens_access() {
+fn b3_a_deny_survives_attenuation_and_clamp() {
     let (root, parent) = jail_with_secret();
     let k = kernel(&root);
     let parent_read = source(&k, "secret/k.txt", &parent);
@@ -548,14 +547,6 @@ fn known_gap_858_a_dropped_deny_scope_widens_access() {
     );
     std::fs::remove_dir_all(&root).ok();
     assert!(parent_read.is_err(), "sanity: the parent denies");
-    assert_eq!(
-        attenuated.unwrap(),
-        b"PRIVATE",
-        "gap #858 (attenuate) closed? flip this test"
-    );
-    assert_eq!(
-        clamped.unwrap(),
-        b"PRIVATE",
-        "gap #858 (clamp) closed? flip this test"
-    );
+    assert!(attenuated.is_err(), "an attenuated delegate must not read past the deny");
+    assert!(clamped.is_err(), "a clamped peer must not read past the deny");
 }
