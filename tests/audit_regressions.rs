@@ -547,6 +547,12 @@ fn b3_a_deny_survives_attenuation_and_clamp() {
     );
     std::fs::remove_dir_all(&root).ok();
     assert!(parent_read.is_err(), "sanity: the parent denies");
-    assert!(attenuated.is_err(), "an attenuated delegate must not read past the deny");
-    assert!(clamped.is_err(), "a clamped peer must not read past the deny");
+    assert!(
+        attenuated.is_err(),
+        "an attenuated delegate must not read past the deny"
+    );
+    assert!(
+        clamped.is_err(),
+        "a clamped peer must not read past the deny"
+    );
 }
