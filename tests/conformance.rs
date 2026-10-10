@@ -17,6 +17,11 @@
 //!   depends on the file — so an empty thread set here would be a real defect
 //!   (a read cached forever with nothing to cut it), never a declaration.
 //!
+//! Both constructors are instance-built — each is handed a jail root — so both
+//! are declared HOST-NAMED (`SPACE-NAME`): neither may claim a name, because two
+//! calls with two roots hold doors that resolve to different files, and only
+//! the host knows which root it passed in.
+//!
 //! No opt-outs, no module namespace (there is no RDF face).
 
 use ikigai_conformance::{Fixture, Report, Suite};
@@ -61,11 +66,13 @@ fn suite() -> Suite {
 }
 
 /// Run `suite` over a kernel rooted at a fresh jail, clean up, and hand back
-/// the report.
-fn run(suite: Suite, mount: impl FnOnce(&PathBuf) -> EndpointSpace) -> Report {
+/// the report. The one space built is handed to both the kernel and the suite,
+/// declared host-named under `label` (the call that built it).
+fn run(suite: Suite, label: &str, mount: impl FnOnce(&PathBuf) -> EndpointSpace) -> Report {
     let root = temp_root();
-    let kernel = Kernel::new(Arc::new(mount(&root)));
-    let report = suite.run_blocking(&kernel);
+    let space = Arc::new(mount(&root));
+    let kernel = Kernel::new(space.clone());
+    let report = suite.host_named_space(label, space).run_blocking(&kernel);
     std::fs::remove_dir_all(&root).ok();
     report
 }
@@ -84,7 +91,9 @@ fn assert_shape(report: &Report) {
 
 #[test]
 fn conforms() {
-    let report = run(suite(), |root| ikigai_fs::space(root));
+    let report = run(suite(), "ikigai_fs::space(root)", |root| {
+        ikigai_fs::space(root)
+    });
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
@@ -93,9 +102,11 @@ fn conforms() {
 
 #[test]
 fn cacheable_mount_conforms() {
-    let report = run(suite().cacheable(ENDPOINT), |root| {
-        ikigai_fs::cacheable_space(root)
-    });
+    let report = run(
+        suite().cacheable(ENDPOINT),
+        "ikigai_fs::cacheable_space(root)",
+        |root| ikigai_fs::cacheable_space(root),
+    );
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
