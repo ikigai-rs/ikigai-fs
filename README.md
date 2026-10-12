@@ -43,6 +43,7 @@ relative to the root. Every other way of naming it is refused with
 | `./notes.txt`, `a//b`, `dir/` | a second IRI for one file; the error names the canonical spelling |
 | `..`, an absolute path | outside the jail |
 | `NOTES.txt` for `notes.txt` on a case-insensitive volume (macOS's default), or a different Unicode normalization of the name | the volume folds it onto another name |
+| a name with another meaning on Windows, **on every platform**: a `\`, a `:` (`C:x`, `notes.txt::$DATA`), a trailing `.` or space (`notes.txt.`), or a device name in any case and with any extension (`CON`, `aux.c`, `COM1`, `nul.txt`) | on Windows a drive prefix makes `Path::join` replace the jail's root, `\` is a separator, a `:` names a data stream, a trailing `.` or space is stripped (so `secret.txt.` opens `secret.txt`, past a deny on it), and a device name opens a device; a `urn:file:` name means one file wherever it is served |
 
 Two consequences follow. The ACL judges exactly the path that is opened. And the
 request IRI **is** the file's identity, so in the cacheable mode the golden thread a
@@ -139,7 +140,10 @@ One crate, a `cfg`-gated backend.
   folding there, so the spelling rules are the whole jail. Text-oriented (it
   refuses non-UTF-8 writes).
 - **Any other native platform** (Windows) has no confined backend yet and
-  **refuses every request** rather than serve one unconfined.
+  **refuses every request** rather than serve one unconfined. A name with another
+  meaning on Windows is refused before that, as a path, on every platform, so a
+  Windows backend inherits the rule rather than having to remember it; ci.yml's
+  `windows-jail` job builds the crate on `windows-latest` and observes both.
 
 ## 0.1.8 (2026-10-07)
 
