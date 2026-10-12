@@ -73,10 +73,12 @@
 //! flat-scope [`Capability`] is untouched; this module does the path-aware
 //! matching, where path semantics belong.
 //!
-//! ⚠ **A deny is an ordinary scope, so attenuation and transport clamps can drop
-//! it** — and dropping an exclusion widens access. Until core gives exclusions a
-//! form that `attenuate`/`clamp` never drop (ledger #858), do not rely on a `-path`
-//! scope surviving delegation or a hop over the wire.
+//! **A `-path` deny survives attenuation and a transport clamp** (since ikigai-core
+//! 0.1.86, ledger #858). A deny is a deny-shaped scope (`ikigai_core::is_deny_scope`),
+//! and core's `attenuate` and `clamp` keep every deny either side holds, so a delegate
+//! attenuated to `{read:/ws}` from `{read:/ws, read:-/ws/secret}` still cannot read
+//! `secret`, and neither can a peer clamped the same way. `tests/audit_regressions.rs`
+//! pins it (`b3_a_deny_survives_attenuation_and_clamp`).
 //!
 //! ## Representations
 //!
