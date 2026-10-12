@@ -145,6 +145,26 @@ One crate, a `cfg`-gated backend.
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
 
+## 0.1.9 (2026-10-11)
+
+**Version call: 0.1.9 (a patch), like 0.1.8.** No public API changes, and the one
+behavior change narrows what the jail serves, so it should reach every consumer through
+its existing `0.1` caret.
+
+- **A name with another meaning on Windows is refused on every platform** (ledger
+  #1319): a path segment containing `\` or `:`, ending in `.` or a space, or whose stem is
+  a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`, `LPT0`-`LPT9`,
+  `CONIN$`, `CONOUT$`, any case, any extension: `aux.c`, `nul.txt`) is now
+  `InvalidArgument` on `path`, before the capability. These are legal file names on
+  Unix and were served there; nothing escaped on any platform (Windows refuses every
+  request, and Unix opens one name at a time from a handle), but a Windows backend would
+  have had to remember the rule. A `windows-latest` CI job now builds the crate for
+  Windows and observes the `Path::join` premise there.
+- **A `-path` deny survives attenuation and a transport clamp**, through ikigai-core
+  0.1.86 (ledger #858); the floor is now `ikigai-core` 0.1.89.
+- Conformance: `ikigai-conformance` 0.6 (dev-dependency), both spaces declared
+  host-named.
+
 ## 0.1.8 (2026-10-07)
 
 **Version call: 0.1.8 (a patch), not 0.2.0.** No public API changes (the same
