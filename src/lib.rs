@@ -32,7 +32,12 @@
 //! - **a non-canonical spelling** — `./notes.txt`, `a//b`, a trailing `/` (the
 //!   error names the canonical one), `..`, or an absolute path;
 //! - **a spelling the volume folds onto another name** — `NOTES.txt` for
-//!   `notes.txt` on a case-insensitive (or normalization-insensitive) volume.
+//!   `notes.txt` on a case-insensitive (or normalization-insensitive) volume;
+//! - **a name with another meaning on Windows**, on every platform — a `\`, a `:`
+//!   (a drive prefix such as `C:x`, which `Path::join` there lets replace the base,
+//!   or a data stream), a trailing `.` or space (stripped there), or a device name
+//!   (`CON`, `aux.c`, `COM1`), so a `urn:file:` name means one file wherever it is
+//!   served.
 //!
 //! So the request IRI *is* the file's identity: the ACL judges the path that is
 //! opened, and the golden thread a read hangs from is the one every write to that
@@ -403,8 +408,9 @@ fn cap_action(verb: Verb) -> Option<&'static str> {
 /// Split a request path into its names, or refuse it: the lexical half of the jail.
 ///
 /// A path is accepted only in its one canonical spelling — `/`-separated names, none
-/// empty, none `.` or `..`, not absolute — so two IRIs can never name one file through
-/// spelling alone. A refusal of a non-canonical spelling names the canonical one.
+/// empty, none `.` or `..`, not absolute, none with another meaning on Windows
+/// ([`windows_meaning`]) — so two IRIs can never name one file through spelling alone. A
+/// refusal of a non-canonical spelling names the canonical one.
 fn canonical_names(rel: &str) -> Result<Vec<&str>> {
     let names: Vec<&str> = rel.split('/').collect();
     if names.contains(&"..") {
@@ -424,6 +430,15 @@ fn canonical_names(rel: &str) -> Result<Vec<&str>> {
     if kept.is_empty() {
         return Err(deny("an empty path names the jail root, not a file"));
     }
+    // Before the canonical-spelling hint, so the hint never names a refused path.
+    for name in &kept {
+        if let Some(why) = windows_meaning(name) {
+            return Err(deny(&format!(
+                "`{name}` {why}, so it is refused on every platform: a `urn:file:` name \
+                 means one file wherever it is served"
+            )));
+        }
+    }
     if kept.len() != names.len() {
         return Err(deny(&format!(
             "`{rel}` is not a canonical spelling (no `.`, empty segments or trailing `/`); \
@@ -432,6 +447,69 @@ fn canonical_names(rel: &str) -> Result<Vec<&str>> {
         )));
     }
     Ok(names)
+}
+
+/// Why one path segment would mean something else on Windows, or `None` when it is one
+/// ordinary directory entry on every platform (ledger #1319).
+///
+/// On Windows `Path::join` with a drive-prefixed name (`C:x`) REPLACES the base, `\` is a
+/// separator, a `:` names a drive or an NTFS stream (`notes.txt::$DATA` opens
+/// `notes.txt`), a trailing `.` or space is stripped (`notes.txt.` opens `notes.txt`, past
+/// a deny on it), and `CON`, `aux.c` and their kin name devices. Each is a legal file name
+/// on Unix, and refused there too: a name that is one file on macOS and another path on
+/// Windows is not a name to serve.
+///
+/// The rule is ikigai-cli's `ikigai_resolve::is_plain_file_name` (ledger #1307) applied to
+/// each segment, copied rather than depended on: ledger #1320 decides where the shared rule
+/// lives, and a host crate is no dependency for a module to take for one function. Keep the
+/// two in step until then. Empty, `.`, `..`, `/` and NUL are refused by
+/// [`canonical_names`] before this runs, and are refused here too so the rule stands alone.
+fn windows_meaning(name: &str) -> Option<&'static str> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return Some("is not one path segment");
+    }
+    if name.contains('\\') {
+        return Some("contains `\\`, a path separator on Windows");
+    }
+    if name.contains(':') {
+        return Some("contains `:`, which names a drive or a data stream on Windows");
+    }
+    if name.ends_with(['.', ' ']) {
+        return Some("ends in `.` or a space, which Windows strips, so it opens another name");
+    }
+    if is_windows_device_name(name) {
+        return Some(
+            "is a Windows device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, CONIN$, CONOUT$)",
+        );
+    }
+    // What this platform's own parser makes of it: on Windows this is where a rooted or
+    // prefixed spelling the checks above missed would show; on Unix, after the checks
+    // above, a segment is always one `Normal`.
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(only)), None) if only == name => None,
+        _ => Some("is not one plain path segment on this platform"),
+    }
+}
+
+/// Whether Windows reads `name` as a DOS device rather than a file: the part before the
+/// first `.`, with trailing spaces dropped, is a reserved name in any case (`nul`,
+/// `Com1.log`, `LPT¹`). `CONIN$` and `CONOUT$` are included, as current Windows treats them
+/// the same way. The same list as ikigai-cli's (see [`windows_meaning`]).
+fn is_windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        _ => ["COM", "LPT"].iter().any(|port| {
+            upper.strip_prefix(port).is_some_and(|n| {
+                matches!(
+                    n,
+                    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        }),
+    }
 }
 
 /// Whether a `Source` asks for raw bytes. `as` is declared `one_of
@@ -1687,6 +1765,176 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    // --- names with another meaning on Windows (ledger #1319) ------------------------
+
+    /// Names that are one ordinary entry on macOS and Linux and something else on
+    /// Windows: a drive prefix (`C:x`, which `Path::join` there lets REPLACE the base), a
+    /// rooted or UNC spelling, a `\` separator, an NTFS stream (`notes.txt::$DATA` opens
+    /// `notes.txt`), a trailing `.` or space (stripped there, so `notes.txt.` opens
+    /// `notes.txt` and walks around a deny on it), or a device name (`CON`, `aux.c`).
+    const WINDOWS_MEANINGS: &[&str] = &[
+        "C:x",
+        "C:",
+        "C:/x",
+        "dir/C:x",
+        r"C:\x",
+        r"\\?\C:\x",
+        r"\\server\share",
+        r"\x",
+        r"a\b",
+        r"..\x",
+        "notes.txt:stream",
+        "notes.txt::$DATA",
+        "notes.txt.",
+        "notes.txt ",
+        "...",
+        ".. ",
+        "CON",
+        "con",
+        "nul.txt",
+        "dir/aux.c",
+        "COM1",
+        "lpt¹",
+        "CONIN$",
+        "NUL .txt",
+    ];
+
+    /// The lexical half of the jail refuses them on EVERY platform, so a `urn:file:` name
+    /// means one file wherever it is served. This is the test that runs on macOS and
+    /// Linux, where none of these names would leave the jail.
+    #[test]
+    fn a_name_with_another_meaning_on_windows_is_refused_on_every_platform() {
+        for name in WINDOWS_MEANINGS {
+            assert!(
+                matches!(canonical_names(name), Err(Error::InvalidArgument { ref name, .. }) if name == "path"),
+                "{name:?} must be refused as a path, got {:?}",
+                canonical_names(name)
+            );
+        }
+    }
+
+    /// The other side of the rule: names Windows also reads as one ordinary file are kept.
+    #[test]
+    fn a_name_windows_also_reads_as_one_file_is_kept() {
+        for name in [
+            "notes.txt",
+            "dir/notes.txt",
+            "a..b",
+            ".hidden",
+            "console",
+            "COM10",
+            "LPT",
+            "nullable.txt",
+            "auxiliary/con-fig.toml",
+            "with space.txt",
+        ] {
+            assert!(canonical_names(name).is_ok(), "{name:?} is one plain path");
+        }
+    }
+
+    /// End to end on a Unix volume, where each name is a LEGAL file: planted in the jail,
+    /// it is refused before the capability and before the disk, never served and never
+    /// written (it used to be read back, and written, as an ordinary file).
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_file_with_a_windows_meaning_is_not_served_on_unix() {
+        // A jail per name: `C:` (a file) and `C:/x` (a directory) cannot share one, and
+        // `con` would fold onto `CON` on a case-insensitive volume.
+        for name in WINDOWS_MEANINGS {
+            let root = temp_root();
+            let ep = FileEndpoint::new(&root);
+            let host = root.join(name);
+            std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+            std::fs::write(&host, b"planted").unwrap();
+            let read = invoke(&ep, Verb::Source, name, &Capability::root(), &[]);
+            assert!(
+                matches!(read, Err(Error::InvalidArgument { ref name, .. }) if name == "path"),
+                "Source {name:?} must be refused, got {read:?}"
+            );
+            // Structural, so it comes before the capability: an empty one is not `Denied`.
+            let bare = invoke(&ep, Verb::Exists, name, &cap(&[]), &[]);
+            assert!(
+                matches!(bare, Err(Error::InvalidArgument { .. })),
+                "Exists {name:?} under no capability must be refused as a path, got {bare:?}"
+            );
+            let overwrite = invoke(
+                &ep,
+                Verb::Sink,
+                name,
+                &Capability::root(),
+                &[("content", b"changed")],
+            );
+            assert!(
+                matches!(overwrite, Err(Error::InvalidArgument { .. })),
+                "Sink {name:?} must be refused, got {overwrite:?}"
+            );
+            assert_eq!(std::fs::read(&host).unwrap(), b"planted", "{name:?}");
+            std::fs::remove_dir_all(&root).ok();
+        }
+        let root = temp_root();
+        let ep = FileEndpoint::new(&root);
+        let fresh = invoke(
+            &ep,
+            Verb::Sink,
+            "D:new.txt",
+            &Capability::root(),
+            &[("content", b"x")],
+        );
+        assert!(
+            matches!(fresh, Err(Error::InvalidArgument { .. })),
+            "{fresh:?}"
+        );
+        assert!(!root.join("D:new.txt").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Why a Unix-only rule passed every test here: on Unix these names do NOT leave the
+    /// directory they are joined to. The premise is observed on Windows below.
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_a_windows_drive_prefix_is_an_ordinary_name() {
+        let base = Path::new("/ws");
+        for name in ["C:x", r"C:\x", r"\\server\share"] {
+            assert!(base.join(name).starts_with(base), "{name:?}");
+        }
+    }
+
+    /// The premise of ledger #1319, observed where it holds: on Windows a drive-prefixed,
+    /// rooted or UNC name REPLACES the base when joined. And what the endpoint does with
+    /// each: refused lexically, as a path, before any backend runs; while an ordinary name
+    /// is refused by the backend, which has no confined walk on Windows yet. So on Windows
+    /// no request reaches the disk at all, today. Runs on the `windows` job in ci.yml.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_drive_prefix_replaces_the_base_and_is_refused() {
+        let base = Path::new(r"D:\ws");
+        for name in ["C:x", r"C:\x", r"\\?\C:\x", r"\\server\share\x", r"\x"] {
+            let joined = base.join(name);
+            assert!(
+                !joined.starts_with(base),
+                "{name:?} joined to {} stayed inside it: {}",
+                base.display(),
+                joined.display()
+            );
+        }
+        let root = temp_root();
+        let ep = FileEndpoint::new(&root);
+        for name in WINDOWS_MEANINGS {
+            let read = invoke(&ep, Verb::Source, name, &Capability::root(), &[]);
+            assert!(
+                matches!(read, Err(Error::InvalidArgument { ref name, .. }) if name == "path"),
+                "Source {name:?} must be refused as a path, got {read:?}"
+            );
+        }
+        std::fs::write(root.join("notes.txt"), b"x").unwrap();
+        let plain = invoke(&ep, Verb::Source, "notes.txt", &Capability::root(), &[]);
+        assert!(
+            matches!(plain, Err(Error::Endpoint(ref why)) if why.contains("no confined backend")),
+            "an ordinary name is refused by the backend on Windows, got {plain:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // --- the ACL's specificity ------------------------------------------------------

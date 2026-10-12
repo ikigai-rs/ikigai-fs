@@ -13,3 +13,21 @@ jobs:
       # The jail's case- and normalization-folding refusals only exist on a folding
       # volume (macOS's default APFS); Linux CI skips those tests.
       macos: true
+  # The jail's lexical rule refuses, on every platform, the names that mean something
+  # else on Windows (ledger #1319), and its premise (`Path::join("C:x")` REPLACES the
+  # base) only holds on Windows. This job is where that premise is observed rather than
+  # cited, along with what the endpoint does on Windows today: a refused name is refused
+  # as a path, and every other request by the backend, which has no confined walk there.
+  # It is also the only build of this crate for Windows: the fallback backend was never
+  # compiled by CI before. Scoped to the lib tests named `windows` because every other
+  # test reads and writes files, and Windows serves none. Cheap: the crate needs only
+  # ikigai-core and pure-Rust dev-dependencies.
+  # ⚠ Inline cargo beside the shared caller: ci-drift reads this repo as `caller+inline`.
+  windows-jail:
+    name: jail names (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib windows
