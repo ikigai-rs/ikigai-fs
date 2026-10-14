@@ -59,10 +59,20 @@ fn temp_root() -> PathBuf {
 /// `urn:file:conformance.txt` — the suite forms one target per bound entry, so
 /// a binding on any verb's fixture would do, but each verb states its own so
 /// the intent survives a suite that looks them up per action.
+///
+/// `required_on_mutating`: `REQUIRED` probes `Source` and `Exists` by default,
+/// and neither declares a required by-value input (`path` is a binding), so
+/// the default checks nothing here. The one required by-value input this
+/// endpoint has is `Sink`'s `content`. Opting the mutating verbs in fires the
+/// `Sink` once more without it, which is safe because the kernel is a fixture
+/// jailed to a temporary directory, and holds the declaration to a typed
+/// refusal.
 fn suite() -> Suite {
-    VERBS.iter().fold(Suite::new(), |suite, verb| {
-        suite.fixture(Fixture::new(ENDPOINT, *verb).binding("path", SEEDED))
-    })
+    VERBS
+        .iter()
+        .fold(Suite::new().required_on_mutating(), |suite, verb| {
+            suite.fixture(Fixture::new(ENDPOINT, *verb).binding("path", SEEDED))
+        })
 }
 
 /// Run `suite` over a kernel rooted at a fresh jail, clean up, and hand back
