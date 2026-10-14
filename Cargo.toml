@@ -36,5 +36,5 @@ web-sys = { version = "0.3", features = ["Window", "Storage"] }
 futures = "0.3"
 # The module recipe as one test (`tests/conformance.rs`): walks every bound
 # endpoint and reports every violation at once. A 0.x caret is a CEILING too:
-# "0.6.0" admits 0.6.x only, so the next minor is a deliberate pin change.
-ikigai-conformance = "0.6.0"
+# "0.8.0" admits 0.8.x only, so the next minor is a deliberate pin change.
+ikigai-conformance = "0.8.0"
