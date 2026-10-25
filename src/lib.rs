@@ -1494,6 +1494,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    // Characterization of the unresolved #229 design question, not the desired
+    // contract. Replace this expectation when the owner chooses text or encoding.
+    fn sink_xsd_string_contract_mismatch_229() {
+        let root = temp_root();
+        let ep = FileEndpoint::new(&root);
+        let payload = vec![0x00, 0xff, 0xfe, 0x80];
+        assert!(std::str::from_utf8(&payload).is_err());
+        let result = invoke(
+            &ep,
+            Verb::Sink,
+            "binary.dat",
+            &Capability::root(),
+            &[("content", &payload)],
+        );
+        let written = std::fs::read(root.join("binary.dat")).ok();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            result.is_ok(),
+            "native Sink currently accepts non-UTF-8: {result:?}"
+        );
+        assert_eq!(written.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
     fn write_capability_sinks_and_then_sources_back() {
         let root = temp_root();
         let ep = FileEndpoint::new(&root);
