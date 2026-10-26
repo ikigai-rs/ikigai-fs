@@ -88,7 +88,11 @@ does the path-aware matching.
   `text/plain` when the bytes are valid UTF-8), or raw bytes with
   `as=application/octet-stream`. **Any other `as` is refused** — the endpoint
   does not convert, so it will not relabel. Uncacheable (a file is a live fact).
-- `Sink` — write the `content` argument's bytes, creating missing directories.
+- `Sink` — write `content`, creating missing directories. The optional `encoding`
+  input is one of `utf-8` (the default) and `base64`. Content stays `xsd:string`:
+  use UTF-8 text directly, or standard padded base64 for arbitrary bytes. For
+  example, `content="AP/+gA==", encoding="base64"` writes `[0, 255, 254, 128]`.
+  Malformed base64, non-UTF-8 text, and unsupported encodings are `InvalidArgument`.
 - `Exists` / `Delete` — existence check (a read) and removal (a delete).
 
 A missing file is the typed `NotFound` (for `Source` and `Delete`; `Exists`
@@ -98,6 +102,11 @@ A failed check is an error, never a `false`.
 Every input is typed (`xsd:string`) and `path` is declared as the `{path}`
 binding of the grammar on every action, so the whole `urn:file:*` grammar is
 selectable from the action manifold and projects as one well-typed MCP tool.
+
+The browser backend stores new writes as base64 under `ikigai:fs-bytes:<root>/<path>`
+in localStorage, and falls back to existing `ikigai:fs:<root>/<path>` text entries.
+New writes take precedence; deletion removes both entries. Older module versions
+cannot read the new namespace. Source's inputs and representation rules are unchanged.
 
 ## Mounting
 

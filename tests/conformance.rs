@@ -24,6 +24,8 @@
 //!
 //! No opt-outs, no module namespace (there is no RDF face).
 
+#![cfg(not(target_family = "wasm"))]
+
 use ikigai_conformance::{Fixture, Report, Suite};
 use ikigai_core::{EndpointSpace, Kernel, Verb};
 use std::path::PathBuf;
