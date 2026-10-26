@@ -13,8 +13,8 @@ every request**, and both judge **the file actually opened**:
 1. **The jail (structural, mount-time).** `FileEndpoint::new(root)` will never
    serve a file outside `root`. The request path is walked one name at a time from
    an open handle on the root (`openat`, `O_NOFOLLOW`), and the read or write
-   happens on the handle that walk produced, so nothing can be swapped in between
-   the check and the use. A root that cannot be opened serves nothing: the jail
+   uses the checked file handle or publishes through the checked parent directory
+   handle. A root that cannot be opened serves nothing: the jail
    fails closed, and the endpoint never creates its own root. Even a `root`
    capability cannot escape it.
 2. **The capability path-ACL (dynamic, per request).** The invocation's
@@ -89,6 +89,13 @@ does the path-aware matching.
   `as=application/octet-stream`. **Any other `as` is refused** — the endpoint
   does not convert, so it will not relabel. Uncacheable (a file is a live fact).
 - `Sink` — write the `content` argument's bytes, creating missing directories.
+  On Unix, writes stage in the opened parent directory, sync the complete file,
+  then atomically replace the target. A new target is published exclusively.
+  Readers see complete old or new content; failed staging leaves the old target
+  intact. Replacement preserves ordinary permission bits, but creates a new inode
+  (ownership, extended attributes, and hard-link identity are not preserved) and
+  requires a writable parent directory. A killed process may leave an unpublished
+  staging file. Power-loss durability of the directory entry is not guaranteed.
 - `Exists` / `Delete` — existence check (a read) and removal (a delete).
 
 A missing file is the typed `NotFound` (for `Source` and `Delete`; `Exists`
@@ -183,8 +190,9 @@ where it saw answers:
   stale cached read or existence answer after a write through another spelling.
 - **A root that cannot be opened fails closed** (containment was skipped), and the
   endpoint no longer creates a missing root.
-- **The read and the write happen on the handle the jail check produced**, which
-  closes the check-then-use race (a directory swapped for a link mid-request).
+- **Reads use checked file handles; writes publish through checked directory
+  handles**, so a directory swapped for a link cannot redirect the operation.
+  Sink checks the existing leaf's inode both before staging and before publication.
 - **Rule specificity is path depth**, not the scope string's length, so
   `/ws/secret/` and `/ws/secret` are one directory and a deny wins the tie.
 - **Scopes match under the root's canonical spelling** as well as the mounted one
