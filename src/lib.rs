@@ -86,14 +86,15 @@
 //! extension, or `text/plain` when the bytes decode as UTF-8); pass `as` =
 //! `application/octet-stream` to get the raw **bytes** instead. Any other `as` is
 //! refused: this endpoint does not convert, so it will not relabel. `Sink` writes
-//! the `content` argument's bytes. On Unix, Sink syncs a same-directory staging
-//! file before atomic publication, so readers see complete old or new content
-//! and a failed staging write leaves the target intact. Replacement preserves
-//! ordinary permission bits, but not ownership, extended attributes, or hard-link
-//! identity. It requires write access to the parent directory. A killed process
-//! can leave an unpublished staging file; directory-entry durability across a
-//! power loss is not guaranteed. A missing file is the typed
-//! [`Error::NotFound`]. Errors name the request's IRI, never a host path. Reads
+//! UTF-8 `content` by default, or decodes it to bytes with `encoding=base64`.
+//! On Unix, Sink syncs a same-directory staging file before atomic publication,
+//! so readers see complete old or new content and a failed staging write leaves
+//! the target intact. Replacement preserves ordinary permission bits, but not
+//! ownership, extended attributes, or hard-link identity. It requires write
+//! access to the parent directory. A killed process can leave an unpublished
+//! staging file; directory-entry durability across a power loss is not
+//! guaranteed. A missing file is the typed [`Error::NotFound`]. Errors name the
+//! request's IRI, never a host path. Reads
 //! (and `Exists` answers) are **uncacheable by default** — a file is a live fact —
 //! but a mount can opt into caching them under a **golden thread**
 //! ([`FileEndpoint::cacheable`] / [`cacheable_space`]): a `Sink`/`Delete` through
@@ -141,9 +142,8 @@ pub const FILE_TEMPLATE: &str = "urn:file:{path}";
 pub const MAX_FILE_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The datatype every input of this module carries: a root-relative path, a
-/// media type, and the bytes to write all arrive as strings on the wire and in
-/// an agent's tool call. (The bytes are not base64 — `content` is the payload
-/// itself, which the wasm backend additionally requires to be UTF-8.)
+/// media type, encoding, and content all arrive as strings on the wire and in
+/// an agent's tool call. Binary content is expressed with `encoding=base64`.
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
 /// The one `as` a `Source` honors: the raw bytes, unlabeled.
@@ -271,8 +271,8 @@ impl Endpoint for FileEndpoint {
                 }
             }
             Verb::Sink => {
-                let content = inv.inline_arg("content")?;
-                found.write(content, iri)?;
+                let content = sink_content(inv)?;
+                found.write(&content, iri)?;
                 Ok(ack(format!("wrote {} bytes to {rel}", content.len())))
             }
             Verb::Exists => {
@@ -330,10 +330,11 @@ impl Endpoint for FileEndpoint {
             )
             .input(
                 ArgSpec::new("content")
-                    .summary("Bytes to write (Sink only).")
+                    .summary("UTF-8 text, or standard padded base64 when encoding=base64 (Sink only).")
                     .class(XSD_STRING)
                     .optional(),
             )
+            .input(sink_encoding_arg())
             .input(
                 ArgSpec::new("as")
                     .summary("Source only: application/octet-stream for raw bytes; nothing else is accepted.")
@@ -393,9 +394,10 @@ impl Endpoint for FileEndpoint {
                     )
                     .input(
                         ArgSpec::new("content")
-                            .summary("the bytes to write")
+                            .summary("UTF-8 text, or standard padded base64 when encoding=base64")
                             .class(XSD_STRING),
                     )
+                    .input(sink_encoding_arg())
                     .output("text/plain;charset=utf-8"),
             )
             .action(
@@ -528,6 +530,41 @@ fn is_windows_device_name(name: &str) -> bool {
                     "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
                 )
             })
+        }),
+    }
+}
+
+/// Kept identical in the aggregate description and the Sink action contract.
+fn sink_encoding_arg() -> ArgSpec {
+    ArgSpec::new("encoding")
+        .summary("Sink only: encoding of content; defaults to utf-8.")
+        .class(XSD_STRING)
+        .one_of(["utf-8", "base64"])
+        .optional()
+        .default_value("utf-8")
+}
+
+fn sink_content<'a>(inv: &'a Invocation<'_>) -> Result<std::borrow::Cow<'a, [u8]>> {
+    use base64::Engine as _;
+    let encoding = if inv.request.args.contains_key("encoding") {
+        inv.inline_str("encoding")?
+    } else {
+        "utf-8"
+    };
+    match encoding {
+        "utf-8" => Ok(std::borrow::Cow::Borrowed(
+            inv.inline_str("content")?.as_bytes(),
+        )),
+        "base64" => base64::engine::general_purpose::STANDARD
+            .decode(inv.inline_arg("content")?)
+            .map(std::borrow::Cow::Owned)
+            .map_err(|_| Error::InvalidArgument {
+                name: "content".to_string(),
+                detail: "expected canonical standard-alphabet base64 with padding".to_string(),
+            }),
+        _ => Err(Error::InvalidArgument {
+            name: "encoding".to_string(),
+            detail: "expected utf-8 or base64".to_string(),
         }),
     }
 }
@@ -1358,12 +1395,14 @@ mod backend {
 /// coexist in one origin's store. `localStorage` has no links and no case folding,
 /// so a key has one spelling and the lexical rules are the whole jail.
 ///
-/// `localStorage` holds UTF-16 strings, so this backend is text-oriented: a write
-/// of non-UTF-8 bytes is refused (binary would need an encoding such as base64 —
-/// a later step). The REPL's `sink`/`source` are text, which is the intended use.
+/// New writes store base64 in a separate `ikigai:fs-bytes:` namespace. Reads
+/// prefer that entry, falling back to the original text key for existing stores.
+/// Separate keys avoid interpreting any legacy text as a binary format marker;
+/// the encoding is internal and Source still returns the stored bytes.
 #[cfg(target_family = "wasm")]
 mod backend {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     pub(super) struct Jail {
         root: PathBuf,
@@ -1399,16 +1438,29 @@ mod backend {
         pub(super) fn probe(self, names: &[&str], iri: &str) -> Result<Found> {
             // The same key the pre-0.1.8 backend used for a canonical spelling.
             let key = format!("ikigai:fs:{}", self.root.join(names.join("/")).display());
-            let present = storage(iri)?
-                .get_item(&key)
+            let bytes_key = format!(
+                "ikigai:fs-bytes:{}",
+                self.root.join(names.join("/")).display()
+            );
+            let store = storage(iri)?;
+            let present = store
+                .get_item(&bytes_key)
                 .map_err(|_| Error::Endpoint(format!("exists `{iri}`: localStorage error")))?
+                .or(store
+                    .get_item(&key)
+                    .map_err(|_| Error::Endpoint(format!("exists `{iri}`: localStorage error")))?)
                 .is_some();
-            Ok(Found { key, present })
+            Ok(Found {
+                key,
+                bytes_key,
+                present,
+            })
         }
     }
 
     pub(super) struct Found {
         key: String,
+        bytes_key: String,
         present: bool,
     }
 
@@ -1418,7 +1470,16 @@ mod backend {
         }
 
         pub(super) fn read(self, iri: &str) -> Result<Vec<u8>> {
-            let value = storage(iri)?
+            let store = storage(iri)?;
+            if let Some(encoded) = store
+                .get_item(&self.bytes_key)
+                .map_err(|_| Error::Endpoint(format!("read `{iri}`: localStorage error")))?
+            {
+                return STANDARD.decode(encoded).map_err(|_| {
+                    Error::Endpoint(format!("read `{iri}`: corrupt base64 in localStorage"))
+                });
+            }
+            let value = store
                 .get_item(&self.key)
                 .map_err(|_| Error::Endpoint(format!("read `{iri}`: localStorage error")))?;
             match value {
@@ -1428,13 +1489,10 @@ mod backend {
         }
 
         pub(super) fn write(self, bytes: &[u8], iri: &str) -> Result<()> {
-            let text = std::str::from_utf8(bytes).map_err(|_| {
-                Error::Endpoint(format!(
-                    "write `{iri}`: the localStorage backend stores UTF-8 text (binary needs base64)"
-                ))
-            })?;
+            // One set_item atomically replaces the complete file, even when quota
+            // exhaustion refuses a write. Legacy text remains a read-only fallback.
             storage(iri)?
-                .set_item(&self.key, text)
+                .set_item(&self.bytes_key, &STANDARD.encode(bytes))
                 .map_err(|_| Error::Endpoint(format!("write `{iri}`: localStorage error (quota?)")))
         }
 
@@ -1442,8 +1500,11 @@ mod backend {
             if !self.present {
                 return Err(Error::NotFound(format!("`{iri}` does not exist")));
             }
-            storage(iri)?
+            let store = storage(iri)?;
+            // Remove the fallback first so deletion cannot resurrect legacy text.
+            store
                 .remove_item(&self.key)
+                .and_then(|()| store.remove_item(&self.bytes_key))
                 .map_err(|_| Error::Endpoint(format!("delete `{iri}`: localStorage error")))
         }
     }

@@ -18,6 +18,8 @@ categories = ["filesystem", "wasm"]
 # `Representation::depends_on` and the kernel's auto-cut on a `Sink`.
 ikigai-core = "0.1.108" # 0.1.108: typed Error::OverBudget for bounded file reads; 0.1.89: the floor ikigai-conformance 0.6 links (SPACE-NAME); 0.1.86: deny scopes survive attenuate/clamp (ledger #858); 0.1.46: Error::Denied
 async-trait = "0.1"
+# Same vetted RFC 4648 implementation/profile as ikigai-http::base64.
+base64 = "0.22"
 
 # Native backend: the jail resolves every name with `openat` relative to a handle on
 # its parent (`O_NOFOLLOW`, `O_DIRECTORY`), reads the directory to learn a name's
@@ -36,9 +38,15 @@ web-sys = { version = "0.3", features = ["Window", "Storage"] }
 
 [dev-dependencies]
 futures = "0.3"
+
+# The disk fixture and its RDF/random dependencies are native-only.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`): walks every bound
 # endpoint and reports every violation at once. 0.9 adds core 0.1.105's contract-shape
 # checks (REQUIRED probes input groups, OUTPUTS honors output_from, PIPELINE named-only,
 # VALIDATE refuses a default on a binding) and RECOMPUTE; 0.10 adds FAILURES (off unless
 # a suite opts in). A 0.x caret is a range: "0.10.0" admits >=0.10.0, <0.11.0.
 ikigai-conformance = "0.10.0"
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

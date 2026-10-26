@@ -88,7 +88,11 @@ does the path-aware matching.
   `text/plain` when the bytes are valid UTF-8), or raw bytes with
   `as=application/octet-stream`. **Any other `as` is refused** — the endpoint
   does not convert, so it will not relabel. Uncacheable (a file is a live fact).
-- `Sink` — write the `content` argument's bytes, creating missing directories.
+- `Sink` — write `content`, creating missing directories. The optional `encoding`
+  input is one of `utf-8` (the default) and `base64`. Content stays `xsd:string`:
+  use UTF-8 text directly, or standard padded base64 for arbitrary bytes. For
+  example, `content="AP/+gA==", encoding="base64"` writes `[0, 255, 254, 128]`.
+  Malformed base64, non-UTF-8 text, and unsupported encodings are `InvalidArgument`.
   On Unix, writes stage in the opened parent directory, sync the complete file,
   then atomically replace the target. A new target is published exclusively.
   Readers see complete old or new content; failed staging leaves the old target
@@ -112,6 +116,11 @@ A failed check is an error, never a `false`.
 Every input is typed (`xsd:string`) and `path` is declared as the `{path}`
 binding of the grammar on every action, so the whole `urn:file:*` grammar is
 selectable from the action manifold and projects as one well-typed MCP tool.
+
+The browser backend stores new writes as base64 under `ikigai:fs-bytes:<root>/<path>`
+in localStorage, and falls back to existing `ikigai:fs:<root>/<path>` text entries.
+New writes take precedence; deletion removes both entries. Older module versions
+cannot read the new namespace. Source's inputs and representation rules are unchanged.
 
 ## Mounting
 
@@ -149,10 +158,10 @@ One crate, a `cfg`-gated backend.
   `statat`, `mkdirat`, `unlinkat`; no `unsafe` here). Confirming a name's on-disk
   spelling reads its directory, so a directory the host lets the process search
   but not list cannot be served through.
-- **`wasm32`** — the browser's `localStorage` (keyed `ikigai:fs:<root>/<path>`).
-  Same `file:` contract and `urn:cap:fs` scopes; there are no links or case
-  folding there, so the spelling rules are the whole jail. Text-oriented (it
-  refuses non-UTF-8 writes).
+- **`wasm32`** — the browser's `localStorage`, using base64 byte entries and
+  legacy text fallback as described above. Same `file:` contract and `urn:cap:fs`
+  scopes; there are no links or case folding there, so the spelling rules are
+  the whole jail. Supports UTF-8 text and base64 binary writes.
 - **Any other native platform** (Windows) has no confined backend yet and
   **refuses every request** rather than serve one unconfined. A name with another
   meaning on Windows is refused before that, as a path, on every platform, so a
