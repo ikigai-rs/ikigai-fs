@@ -12,8 +12,8 @@
 //!    handed a `root` directory and will never serve a file outside it. The
 //!    request path is resolved component by component from an open handle on the
 //!    root, never following a symbolic link (`openat` with `O_NOFOLLOW`), and the
-//!    read or write happens on the handle that walk produced — so nothing can be
-//!    swapped in between the check and the use. A root that cannot be opened
+//!    read uses the checked file handle; a write stages and atomically publishes
+//!    through the checked parent directory handle. A root that cannot be opened
 //!    serves nothing (fail closed). Even a `root` capability cannot escape it.
 //! 2. **The capability path-ACL (dynamic, per request).** The invocation's
 //!    [`Capability`] must grant the request's action for the resolved path. A
@@ -42,7 +42,7 @@
 //! So the request IRI *is* the file's identity: the ACL judges the path that is
 //! opened, and the golden thread a read hangs from is the one every write to that
 //! file cuts (the kernel auto-cuts a write's own target). Hard links remain
-//! distinct names for one file, as they are to the filesystem.
+//! distinct names; a Sink replaces only its target name with a new inode.
 //!
 //! ## The capability path-ACL
 //!
@@ -86,7 +86,13 @@
 //! extension, or `text/plain` when the bytes decode as UTF-8); pass `as` =
 //! `application/octet-stream` to get the raw **bytes** instead. Any other `as` is
 //! refused: this endpoint does not convert, so it will not relabel. `Sink` writes
-//! the `content` argument's bytes. A missing file is the typed
+//! the `content` argument's bytes. On Unix, Sink syncs a same-directory staging
+//! file before atomic publication, so readers see complete old or new content
+//! and a failed staging write leaves the target intact. Replacement preserves
+//! ordinary permission bits, but not ownership, extended attributes, or hard-link
+//! identity. It requires write access to the parent directory. A killed process
+//! can leave an unpublished staging file; directory-entry durability across a
+//! power loss is not guaranteed. A missing file is the typed
 //! [`Error::NotFound`]. Errors name the request's IRI, never a host path. Reads
 //! (and `Exists` answers) are **uncacheable by default** — a file is a live fact —
 //! but a mount can opt into caching them under a **golden thread**
@@ -989,6 +995,16 @@ mod backend {
         }
 
         pub(super) fn write(self, bytes: &[u8], iri: &str) -> Result<()> {
+            self.write_with(iri, |file| file.write_all(bytes))
+        }
+
+        // Keep the actual I/O injectable so tests can stop after a short write or
+        // return an I/O error at exactly that point, without process-wide hooks.
+        pub(super) fn write_with(
+            self,
+            iri: &str,
+            write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+        ) -> Result<()> {
             let shown = self.shown();
             if self.blocked {
                 return Err(deny(&format!(
@@ -1021,33 +1037,80 @@ mod backend {
                     }
                 }
             }
-            // The leaf: never through a link, and created exclusively when the walk
-            // saw nothing there (so a name that appeared meanwhile is not adopted
-            // under a spelling nobody checked). Truncated only once the handle is
-            // known to be a regular file.
-            let mut flags = OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-            if self.leaf.is_none() {
-                flags |= OFlags::CREATE | OFlags::EXCL;
+            let leaf = *all.last().expect("non-empty");
+            // Retain the old handle until publication, checking the same inode the
+            // probe judged and enforcing the existing file's write permissions.
+            let old = if let Some(expected) = &self.leaf {
+                let fd = rfs::openat(
+                    &dir,
+                    leaf,
+                    OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map_err(|e| match e {
+                    Errno::LOOP | Errno::MLINK => link_refused_shown(&shown),
+                    Errno::NOENT => changed(iri),
+                    e => io_error("write", iri, e),
+                })?;
+                let now = rfs::fstat(&fd).map_err(|e| io_error("write", iri, e))?;
+                require_regular(&now, &shown)?;
+                if now.st_ino != expected.st_ino || now.st_dev != expected.st_dev {
+                    return Err(changed(iri));
+                }
+                Some(fd)
+            } else {
+                None
+            };
+
+            let mode = Mode::from_raw_mode(if self.leaf.is_some() { 0o600 } else { 0o666 });
+            let mut staged = Staged::create(&dir, mode, iri)?;
+            write(&mut staged.file).map_err(|e| Error::Endpoint(format!("write `{iri}`: {e}")))?;
+            // Preserve ordinary permission bits on replacement, without carrying
+            // set-id bits onto new content. New files retain 0666 filtered by umask.
+            if let Some(expected) = &self.leaf {
+                rfs::fchmod(&staged.file, Mode::from_raw_mode(expected.st_mode & 0o777))
+                    .map_err(|e| io_error("set permissions for", iri, e))?;
             }
-            let fd = rfs::openat(
-                &dir,
-                *all.last().expect("non-empty"),
-                flags,
-                Mode::from_raw_mode(0o666),
-            )
-            .map_err(|e| match e {
-                Errno::LOOP | Errno::MLINK => link_refused_shown(&shown),
-                // EXIST: the name appeared since the walk; NOENT: it went away.
-                Errno::EXIST | Errno::NOENT => changed(iri),
-                Errno::ISDIR => deny(&format!("`{shown}` is a directory, not a file")),
-                e => io_error("write", iri, e),
-            })?;
-            let stat = rfs::fstat(&fd).map_err(|e| io_error("write", iri, e))?;
-            require_regular(&stat, &shown)?;
-            rfs::ftruncate(&fd, 0).map_err(|e| io_error("write", iri, e))?;
-            std::fs::File::from(fd)
-                .write_all(bytes)
-                .map_err(|e| Error::Endpoint(format!("write `{iri}`: {e}")))
+            staged
+                .file
+                .sync_all()
+                .map_err(|e| Error::Endpoint(format!("sync `{iri}`: {e}")))?;
+
+            // The temporary name must still refer to the regular inode written
+            // through our handle, rather than an entry substituted during I/O.
+            let staged_stat = rfs::fstat(&staged.file).map_err(|e| io_error("publish", iri, e))?;
+            let named_stat = rfs::statat(&dir, staged.name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|e| io_error("publish", iri, e))?;
+            require_regular(&named_stat, &shown)?;
+            if staged_stat.st_ino != named_stat.st_ino || staged_stat.st_dev != named_stat.st_dev {
+                return Err(changed(iri));
+            }
+
+            if let Some(expected) = &self.leaf {
+                // Revalidate after staging: a new inode or symlink planted while
+                // bytes were being written must not be adopted by this request.
+                let now = rfs::statat(&dir, leaf, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|e| io_error("write", iri, e))?;
+                require_regular(&now, &shown)?;
+                if now.st_ino != expected.st_ino || now.st_dev != expected.st_dev {
+                    return Err(changed(iri));
+                }
+                check_spelling(&dir, leaf, now.st_ino, &all)?;
+                rfs::renameat(&dir, staged.name.as_str(), &dir, leaf)
+                    .map_err(|e| io_error("publish", iri, e))?;
+            } else {
+                // Portable exclusive publication: link a complete file into place.
+                // Unlike rename, linkat cannot overwrite a name that appeared
+                // since the probe. Drop removes only the temporary second name.
+                rfs::linkat(&dir, staged.name.as_str(), &dir, leaf, AtFlags::empty()).map_err(
+                    |e| match e {
+                        Errno::EXIST => changed(iri),
+                        e => io_error("publish", iri, e),
+                    },
+                )?;
+            }
+            drop(old);
+            Ok(())
         }
 
         pub(super) fn delete(self, iri: &str) -> Result<()> {
@@ -1065,6 +1128,56 @@ mod backend {
                 Errno::NOENT => not_found(iri),
                 e => io_error("delete", iri, e),
             })
+        }
+    }
+
+    /// A staging file in the *opened* parent, never a host path that re-walks
+    /// the jail. Exclusive creation refuses collisions and Drop cleans every
+    /// ordinary error path (a killed process can leave an unpublished orphan).
+    struct Staged<'a> {
+        dir: &'a OwnedFd,
+        name: String,
+        file: std::fs::File,
+    }
+
+    impl<'a> Staged<'a> {
+        fn create(dir: &'a OwnedFd, mode: Mode, iri: &str) -> Result<Self> {
+            for _ in 0..16 {
+                let mut random = [0u8; 16];
+                getrandom::fill(&mut random).map_err(|_| {
+                    Error::Endpoint(format!("stage `{iri}`: randomness unavailable"))
+                })?;
+                let name = format!(".ikigai-fs-{:032x}.tmp", u128::from_ne_bytes(random));
+                match rfs::openat(
+                    dir,
+                    name.as_str(),
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    mode,
+                ) {
+                    Ok(fd) => {
+                        return Ok(Self {
+                            dir,
+                            name,
+                            file: fd.into(),
+                        })
+                    }
+                    Err(Errno::EXIST) => continue,
+                    Err(e) => return Err(io_error("stage", iri, e)),
+                }
+            }
+            Err(Error::Endpoint(format!(
+                "stage `{iri}`: temporary name collisions"
+            )))
+        }
+    }
+
+    impl Drop for Staged<'_> {
+        fn drop(&mut self) {
+            let _ = rfs::unlinkat(self.dir, self.name.as_str(), AtFlags::empty());
         }
     }
 
@@ -2056,6 +2169,179 @@ mod tests {
             Err(Error::InvalidArgument { .. })
         ));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sink_that_fails_after_a_short_write_preserves_the_old_file() {
+        use std::io::Write;
+        let root = temp_root();
+        std::fs::write(root.join("f"), b"old complete content").unwrap();
+        let found = backend::probe_for_test(&root, &["f"]).unwrap();
+        let result = found.write_with("urn:file:f", |file| {
+            file.write_all(b"new prefix")?;
+            Err(std::io::Error::other(
+                "injected disk-full after a short write",
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(root.join("f")).unwrap(),
+            b"old complete content"
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_source_during_a_sink_sees_only_complete_content() {
+        use std::io::Write;
+        let root = temp_root();
+        std::fs::write(root.join("f"), b"old complete content").unwrap();
+        let already_open = backend::probe_for_test(&root, &["f"]).unwrap();
+        let found = backend::probe_for_test(&root, &["f"]).unwrap();
+        found
+            .write_with("urn:file:f", |file| {
+                file.write_all(b"new prefix")?;
+                // The writer is paused after a real short write while a separate
+                // thread executes Source through the endpoint and its jail checks.
+                let observed = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            invoke(
+                                &FileEndpoint::new(&root),
+                                Verb::Source,
+                                "f",
+                                &Capability::root(),
+                                &[],
+                            )
+                            .unwrap()
+                            .bytes
+                        })
+                        .join()
+                        .unwrap()
+                });
+                assert_eq!(observed, b"old complete content");
+                file.write_all(b" and suffix")
+            })
+            .unwrap();
+        assert_eq!(
+            backend::probe_for_test(&root, &["f"])
+                .unwrap()
+                .read("urn:file:f")
+                .unwrap(),
+            b"new prefix and suffix"
+        );
+        // A probe from before publication must refuse the new inode.
+        assert!(already_open.read("urn:file:f").is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_sink_is_absent_until_complete_and_absent_on_failure() {
+        use std::io::Write;
+        let root = temp_root();
+        for fail in [true, false] {
+            let result =
+                backend::probe_for_test(&root, &["f"])
+                    .unwrap()
+                    .write_with("urn:file:f", |file| {
+                        file.write_all(b"prefix")?;
+                        assert!(matches!(
+                            backend::probe_for_test(&root, &["f"])
+                                .unwrap()
+                                .read("urn:file:f"),
+                            Err(Error::NotFound(_))
+                        ));
+                        if fail {
+                            return Err(std::io::Error::other("injected failure"));
+                        }
+                        file.write_all(b" suffix")
+                    });
+            if fail {
+                assert!(result.is_err());
+                assert!(!root.join("f").exists());
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            } else {
+                result.unwrap();
+                assert_eq!(std::fs::read(root.join("f")).unwrap(), b"prefix suffix");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sink_refuses_leaf_changes_before_and_during_staging() {
+        use std::io::Write;
+        for existing in [true, false] {
+            for during in [true, false] {
+                let root = temp_root();
+                if existing {
+                    std::fs::write(root.join("f"), b"original").unwrap();
+                }
+                let found = backend::probe_for_test(&root, &["f"]).unwrap();
+                let swap = || {
+                    if existing {
+                        std::fs::rename(root.join("f"), root.join("old")).unwrap();
+                    }
+                    std::fs::write(root.join("f"), b"substitute").unwrap();
+                };
+                if !during {
+                    swap();
+                }
+                let result = found.write_with("urn:file:f", |file| {
+                    file.write_all(b"prefix")?;
+                    if during {
+                        swap();
+                    }
+                    file.write_all(b" suffix")
+                });
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(root.join("f")).unwrap(), b"substitute");
+                if existing {
+                    assert_eq!(std::fs::read(root.join("old")).unwrap(), b"original");
+                }
+                assert_eq!(
+                    std::fs::read_dir(&root).unwrap().count(),
+                    if existing { 2 } else { 1 }
+                );
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_preserves_permissions_and_open_readers() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root();
+        std::fs::write(root.join("f"), b"original").unwrap();
+        std::fs::set_permissions(root.join("f"), std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::hard_link(root.join("f"), root.join("alias")).unwrap();
+        let mut reader = std::fs::File::open(root.join("f")).unwrap();
+        backend::probe_for_test(&root, &["f"])
+            .unwrap()
+            .write(b"replacement", "urn:file:f")
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        assert_eq!(std::fs::read(root.join("alias")).unwrap(), b"original");
+        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::metadata(root.join("f"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// B7, deterministic: the swap happens exactly between the walk (the check) and
