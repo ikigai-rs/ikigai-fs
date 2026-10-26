@@ -144,10 +144,10 @@ One crate, a `cfg`-gated backend.
   `statat`, `mkdirat`, `unlinkat`; no `unsafe` here). Confirming a name's on-disk
   spelling reads its directory, so a directory the host lets the process search
   but not list cannot be served through.
-- **`wasm32`** — the browser's `localStorage` (keyed `ikigai:fs:<root>/<path>`).
-  Same `file:` contract and `urn:cap:fs` scopes; there are no links or case
-  folding there, so the spelling rules are the whole jail. Text-oriented (it
-  refuses non-UTF-8 writes).
+- **`wasm32`** — the browser's `localStorage`, using base64 byte entries and
+  legacy text fallback as described above. Same `file:` contract and `urn:cap:fs`
+  scopes; there are no links or case folding there, so the spelling rules are
+  the whole jail. Supports UTF-8 text and base64 binary writes.
 - **Any other native platform** (Windows) has no confined backend yet and
   **refuses every request** rather than serve one unconfined. A name with another
   meaning on Windows is refused before that, as a path, on every platform, so a
