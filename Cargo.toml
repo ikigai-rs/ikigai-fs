@@ -16,7 +16,7 @@ categories = ["filesystem", "wasm"]
 # so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
 # 0.1.9 carries the golden-thread surface the cacheable file mode needs:
 # `Representation::depends_on` and the kernel's auto-cut on a `Sink`.
-ikigai-core = "0.1.89" # 0.1.89: the floor ikigai-conformance 0.6 links (SPACE-NAME); 0.1.86: deny scopes survive attenuate/clamp (ledger #858); 0.1.46: Error::Denied
+ikigai-core = "0.1.108" # 0.1.108: typed Error::OverBudget for bounded file reads; 0.1.89: the floor ikigai-conformance 0.6 links (SPACE-NAME); 0.1.86: deny scopes survive attenuate/clamp (ledger #858); 0.1.46: Error::Denied
 async-trait = "0.1"
 
 # Native backend: the jail resolves every name with `openat` relative to a handle on

@@ -102,6 +102,9 @@
 //! The module passes `ikigai-conformance` (`tests/conformance.rs`) on both
 //! mounts, with no opt-outs.
 //!
+//! Native file `Source` reads are limited to [`MAX_FILE_SOURCE_BYTES`] (16 MiB).
+//! Larger files are refused with [`Error::OverBudget`], never truncated.
+//!
 //! ## Platforms
 //!
 //! One crate, a `cfg`-gated backend. The native backend (Unix) resolves through
@@ -127,6 +130,15 @@ use ikigai_core::{
 /// where `{path}` is captured root-relative and handed to the endpoint as the
 /// `path` binding (so the file's *identity* is the request, not an argument).
 pub const FILE_TEMPLATE: &str = "urn:file:{path}";
+
+/// Maximum native file payload returned by a `Source`: 16 MiB.
+///
+/// The opened file's metadata is checked before reading, and the read itself is
+/// bounded in case the file grows. Exceeding this limit returns
+/// [`Error::OverBudget`]; a partial representation is never returned.
+/// This bounds each read, not the aggregate memory held by concurrent requests
+/// or cached representations. Browser localStorage uses its own storage quota.
+pub const MAX_FILE_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The datatype every input of this module carries: a root-relative path, a
 /// media type, and the bytes to write all arrive as strings on the wire and in
@@ -987,11 +999,7 @@ mod backend {
                 return Err(changed(iri));
             }
             require_regular(&now, &self.shown())?;
-            let mut bytes = Vec::new();
-            std::fs::File::from(fd)
-                .read_to_end(&mut bytes)
-                .map_err(|e| Error::Endpoint(format!("read `{iri}`: {e}")))?;
-            Ok(bytes)
+            read_bounded(std::fs::File::from(fd), now.st_size, iri)
         }
 
         pub(super) fn write(self, bytes: &[u8], iri: &str) -> Result<()> {
@@ -1179,6 +1187,28 @@ mod backend {
         fn drop(&mut self) {
             let _ = rfs::unlinkat(self.dir, self.name.as_str(), AtFlags::empty());
         }
+    }
+
+    /// Metadata rejects known oversize files without reading; the extra byte
+    /// detects growth (or a file whose reported size understates its contents).
+    pub(super) fn read_bounded(reader: impl Read, size: i64, iri: &str) -> Result<Vec<u8>> {
+        let over_budget = || Error::OverBudget {
+            detail: format!(
+                "read `{iri}` exceeds the {MAX_FILE_SOURCE_BYTES}-byte file Source limit"
+            ),
+        };
+        if size > MAX_FILE_SOURCE_BYTES as i64 {
+            return Err(over_budget());
+        }
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_FILE_SOURCE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| Error::Endpoint(format!("read `{iri}`: {e}")))?;
+        if bytes.len() as u64 > MAX_FILE_SOURCE_BYTES {
+            return Err(over_budget());
+        }
+        Ok(bytes)
     }
 
     enum Step {
@@ -1477,6 +1507,28 @@ mod tests {
     use futures::executor::block_on;
     use ikigai_core::{Bindings, Iri, Request};
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[cfg(unix)]
+    #[test]
+    fn source_read_stays_bounded_when_metadata_understates_the_size() {
+        use std::io::{Read, Seek};
+        let mut reader = std::io::Cursor::new(vec![b'x'; MAX_FILE_SOURCE_BYTES as usize + 2]);
+        let result = backend::read_bounded(&mut reader, 0, "urn:file:growing");
+        assert!(matches!(result, Err(Error::OverBudget { .. })));
+        assert_eq!(reader.stream_position().unwrap(), MAX_FILE_SOURCE_BYTES + 1);
+
+        // An already oversized file must be rejected before any payload is read.
+        let mut reader = std::io::repeat(b'x').take(MAX_FILE_SOURCE_BYTES + 2);
+        assert!(matches!(
+            backend::read_bounded(
+                &mut reader,
+                MAX_FILE_SOURCE_BYTES as i64 + 1,
+                "urn:file:large"
+            ),
+            Err(Error::OverBudget { .. })
+        ));
+        assert_eq!(reader.limit(), MAX_FILE_SOURCE_BYTES + 2);
+    }
 
     #[test]
     fn an_arrangement_file_is_its_own_media_type_not_a_generic_sexpr() {

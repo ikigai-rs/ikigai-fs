@@ -98,6 +98,13 @@ does the path-aware matching.
   staging file. Power-loss durability of the directory entry is not guaranteed.
 - `Exists` / `Delete` — existence check (a read) and removal (a delete).
 
+Native file `Source` reads have a **16 MiB (16,777,216 byte)** payload limit
+(`MAX_FILE_SOURCE_BYTES`). The opened file's metadata is checked before reading;
+the read is also bounded to catch growth. A file above the limit returns typed
+`OverBudget`, never a truncated representation, for both text and raw reads.
+The limit applies per read, including cacheable mounts; it does not bound total
+cache memory or concurrent reads. Browser localStorage retains its storage quota.
+
 A missing file is the typed `NotFound` (for `Source` and `Delete`; `Exists`
 answers `false`). Errors name the request's IRI, never the host path behind it.
 A failed check is an error, never a `false`.

@@ -556,3 +556,44 @@ fn b3_a_deny_survives_attenuation_and_clamp() {
         "a clamped peer must not read past the deny"
     );
 }
+
+/// #2231: Source must refuse oversized files rather than allocate without a bound.
+#[cfg(unix)]
+#[test]
+fn source_refuses_one_byte_over_its_bound_and_reads_exactly_the_bound() {
+    // 16 MiB is the documented per-Source file payload limit.
+    const LIMIT: u64 = ikigai_fs::MAX_FILE_SOURCE_BYTES;
+    let root = temp_dir("source-budget");
+    let cap = Capability::root();
+    for cacheable in [false, true] {
+        for raw in [false, true] {
+            let file = std::fs::File::create(root.join("large.bin")).unwrap();
+            file.set_len(LIMIT + 1).unwrap();
+            let k = if cacheable {
+                cached_kernel(&root)
+            } else {
+                kernel(&root)
+            };
+            let read = || {
+                let mut req = request(Verb::Source, "large.bin");
+                if raw {
+                    req = req.with_arg("as", ArgRef::Inline(b"application/octet-stream".to_vec()));
+                }
+                block_on(k.issue(req, &cap)).map(|r| r.bytes)
+            };
+            let oversized = read();
+            file.set_len(LIMIT).unwrap();
+            let at_limit = read();
+            assert!(
+                matches!(oversized, Err(Error::OverBudget { .. })),
+                "expected OverBudget (cacheable={cacheable}, raw={raw}); got {}",
+                match &oversized {
+                    Ok(bytes) => format!("{} bytes", bytes.len()),
+                    Err(error) => format!("{error:?}"),
+                }
+            );
+            assert_eq!(at_limit.unwrap(), vec![0; LIMIT as usize]);
+        }
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
