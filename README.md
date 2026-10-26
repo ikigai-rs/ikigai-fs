@@ -168,6 +168,14 @@ One crate, a `cfg`-gated backend.
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
 
+## 0.2.0 (2026-10-26)
+
+- Move to `ikigai-core` 0.2.0, the streams release (ledger #2261). This is a
+  breaking dependency upgrade because core types appear in the public API; the
+  previous `0.1` caret excluded 0.2.0 under 0.x version rules.
+- Upgrade `ikigai-conformance` to 0.11.0, including its default DATATYPES and
+  FAILURES checks on both mounts, with no opt-outs.
+
 ## 0.1.9 (2026-10-11)
 
 **Version call: 0.1.9 (a patch), like 0.1.8.** No public API changes, and the one
