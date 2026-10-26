@@ -16,7 +16,7 @@ categories = ["filesystem", "wasm"]
 # so a host links exactly one `ikigai-core` (no duplicate-crate type mismatch).
 # 0.1.9 carries the golden-thread surface the cacheable file mode needs:
 # `Representation::depends_on` and the kernel's auto-cut on a `Sink`.
-ikigai-core = "0.1.89" # 0.1.89: the floor ikigai-conformance 0.6 links (SPACE-NAME); 0.1.86: deny scopes survive attenuate/clamp (ledger #858); 0.1.46: Error::Denied
+ikigai-core = "0.1.108" # 0.1.108: typed Error::OverBudget for bounded file reads; 0.1.89: the floor ikigai-conformance 0.6 links (SPACE-NAME); 0.1.86: deny scopes survive attenuate/clamp (ledger #858); 0.1.46: Error::Denied
 async-trait = "0.1"
 # Same vetted RFC 4648 implementation/profile as ikigai-http::base64.
 base64 = "0.22"
@@ -25,9 +25,11 @@ base64 = "0.22"
 # its parent (`O_NOFOLLOW`, `O_DIRECTORY`), reads the directory to learn a name's
 # on-disk spelling, and reads/writes on the handle the walk produced. `rustix` is the
 # safe wrapper over exactly those calls (no `unsafe` here). 1.0 carries every call used
-# (`openat`, `statat`, `mkdirat`, `unlinkat`, `fstat`, `ftruncate`, `Dir::read_from`).
+# (`openat`, `statat`, `mkdirat`, `unlinkat`, `fstat`, `renameat`, `linkat`, `Dir::read_from`).
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.0", features = ["fs"] }
+# Unpredictable names for exclusively-created, handle-relative staging files.
+getrandom = "0.3"
 
 # Browser backend: localStorage via web-sys. wasm32-only — native hosts don't pull
 # it, so the `std::fs` path stays dependency-light.
