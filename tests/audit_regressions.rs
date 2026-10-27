@@ -558,35 +558,52 @@ fn b3_a_deny_survives_attenuation_and_clamp() {
 }
 
 /// #2231: Source must refuse oversized files rather than allocate without a bound.
+///
+/// Since 0.2.1 (ledger #2245) two bounds: the bytes path (`invoke`) keeps its own
+/// 16 MiB one, and a kernel caller reads the file's body, collected under the run's
+/// byte budget, so a run limited to 16 MiB is refused one byte past it, never
+/// handed a truncated file.
 #[cfg(unix)]
 #[test]
 fn source_refuses_one_byte_over_its_bound_and_reads_exactly_the_bound() {
+    use ikigai_core::{Bindings, Endpoint, Invocation, IssueContext};
     // 16 MiB is the documented per-Source file payload limit.
     const LIMIT: u64 = ikigai_fs::MAX_FILE_SOURCE_BYTES;
     let root = temp_dir("source-budget");
     let cap = Capability::root();
-    for cacheable in [false, true] {
+    for (via_kernel, cacheable) in [(false, false), (true, false), (true, true)] {
         for raw in [false, true] {
             let file = std::fs::File::create(root.join("large.bin")).unwrap();
             file.set_len(LIMIT + 1).unwrap();
-            let k = if cacheable {
-                cached_kernel(&root)
-            } else {
-                kernel(&root)
-            };
+            // A kernel per read: the file is resized out of band below, which a
+            // cacheable mount does not see until a write through the kernel cuts it.
             let read = || {
+                let k = if cacheable {
+                    cached_kernel(&root)
+                } else {
+                    kernel(&root)
+                };
                 let mut req = request(Verb::Source, "large.bin");
                 if raw {
                     req = req.with_arg("as", ArgRef::Inline(b"application/octet-stream".to_vec()));
                 }
-                block_on(k.issue(req, &cap)).map(|r| r.bytes)
+                if via_kernel {
+                    let run = IssueContext::new().with_memory_limit(LIMIT);
+                    block_on(k.issue_with_context(req, &cap, run)).map(|r| r.bytes)
+                } else {
+                    let mut bindings = Bindings::new();
+                    bindings.insert("path", "large.bin");
+                    let inv = Invocation::detached(&req, &bindings, &cap);
+                    block_on(ikigai_fs::FileEndpoint::new(&root).invoke(&inv)).map(|r| r.bytes)
+                }
             };
             let oversized = read();
             file.set_len(LIMIT).unwrap();
             let at_limit = read();
             assert!(
                 matches!(oversized, Err(Error::OverBudget { .. })),
-                "expected OverBudget (cacheable={cacheable}, raw={raw}); got {}",
+                "expected OverBudget (via_kernel={via_kernel}, cacheable={cacheable}, \
+                 raw={raw}); got {}",
                 match &oversized {
                     Ok(bytes) => format!("{} bytes", bytes.len()),
                     Err(error) => format!("{error:?}"),

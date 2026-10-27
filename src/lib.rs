@@ -103,8 +103,23 @@
 //! The module passes `ikigai-conformance` (`tests/conformance.rs`) on both
 //! mounts, with no opt-outs.
 //!
-//! Native file `Source` reads are limited to [`MAX_FILE_SOURCE_BYTES`] (16 MiB).
-//! Larger files are refused with [`Error::OverBudget`], never truncated.
+//! Native file `Source` reads through [`Endpoint::invoke`] (the bytes path) are
+//! limited to [`MAX_FILE_SOURCE_BYTES`] (16 MiB). Larger files are refused with
+//! [`Error::OverBudget`], never truncated.
+//!
+//! ## Bodies
+//!
+//! On the native backend a `Source` also answers a seekable [`Body::Replay`]
+//! ([`Endpoint::invoke_body`], what the kernel calls), backed by the file and not
+//! bound by [`MAX_FILE_SOURCE_BYTES`]: a caller that collects it is bounded by its
+//! run's byte budget. Each reader opens a fresh descriptor through the jailed,
+//! no-follow walk, reads chunks of at most 64 KiB, and ends in
+//! [`Error::Conflict`] when the file changed while read, never a short or mixed
+//! body. A `Sink` reads its content with [`Invocation::content_body`] and writes
+//! it chunk by chunk into the staging file, decoding UTF-8 and base64
+//! incrementally; a stream that fails part-way leaves the target untouched. The
+//! `wasm32` `localStorage` backend keeps answering a buffer and taking inline
+//! content.
 //!
 //! ## Platforms
 //!
@@ -123,8 +138,8 @@ use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ActionSpec, ArgSpec, Capability, Description, Endpoint, EndpointSpace, Error, Invocation,
-    ReprType, Representation, Result, UriTemplate, Verb,
+    ActionSpec, ArgSpec, Body, Capability, Description, Endpoint, EndpointSpace, Error,
+    FailureClass, Invocation, ReprType, Representation, Result, UriTemplate, Verb,
 };
 
 /// The conventional grammar a host mounts this module at: `urn:file:{path}`,
@@ -202,17 +217,31 @@ impl FileEndpoint {
     /// `Sink`/`Delete` through the kernel auto-cuts it, so writes invalidate
     /// correctly. **Caveat:** out-of-band changes (an editor, another process) are
     /// not seen until a kernel-mediated write — or an external watcher — cuts the
-    /// thread. Enable only where that staleness window is acceptable (e.g. a root
-    /// written through ikigai), until the watch policy lands.
+    /// thread. A cached read's body ([`Endpoint::invoke_body`]) is never stale
+    /// bytes: once the file changed out of band, its readers end in
+    /// [`Error::Conflict`] until the thread is cut. Enable only where that window
+    /// is acceptable (e.g. a root written through ikigai), until the watch policy
+    /// lands.
     pub fn cacheable(mut self) -> Self {
         self.cacheable = true;
         self
     }
 }
 
-#[async_trait]
-impl Endpoint for FileEndpoint {
-    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+/// A request that passed both layers of the jail: the walk's result and what
+/// the verb needs to be served.
+struct Admitted<'a> {
+    rel: &'a str,
+    iri: &'a str,
+    leaf: &'a str,
+    raw: bool,
+    found: backend::Found,
+}
+
+impl FileEndpoint {
+    /// Both layers, in order, for every verb: the lexical rules, the capability
+    /// path-ACL, then the walk from the opened root.
+    fn admit<'a>(&self, inv: &'a Invocation<'_>) -> Result<Admitted<'a>> {
         let rel = inv
             .bindings
             .get("path")
@@ -251,29 +280,52 @@ impl Endpoint for FileEndpoint {
 
         // Layer 1, structural half: walk the names from the root handle.
         let found = jail.probe(&names, iri)?;
+        Ok(Admitted {
+            rel,
+            iri,
+            leaf: names.last().copied().unwrap_or_default(),
+            raw,
+            found,
+        })
+    }
 
-        match verb {
+    /// A read's answer, cached under the file's golden thread when the mount
+    /// opted in.
+    fn source_answer<B>(&self, repr: Representation<B>, iri: &str) -> Representation<B> {
+        if self.cacheable {
+            // Cache under a golden thread named after the resource. A
+            // `Sink`/`Delete` (kernel auto-cut) — or an external watcher —
+            // invalidates it. The IRI is the file's only name (aliases are
+            // refused above), so the write that changes the file is the one
+            // that cuts this thread. All representations of the file
+            // (string, raw bytes, body) share it.
+            repr.cacheable().depends_on(iri)
+        } else {
+            // Default: a file is a live fact, recomputed every read.
+            repr
+        }
+    }
+}
+
+#[async_trait]
+impl Endpoint for FileEndpoint {
+    async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let Admitted {
+            rel,
+            iri,
+            leaf,
+            raw,
+            found,
+        } = self.admit(inv)?;
+        match inv.request.verb {
             Verb::Source => {
                 let bytes = found.read(iri)?;
-                let leaf = names.last().copied().unwrap_or_default();
                 let repr = Representation::new(source_type(leaf, &bytes, raw), bytes);
-                if self.cacheable {
-                    // Cache under a golden thread named after the resource. A
-                    // `Sink`/`Delete` (kernel auto-cut) — or an external watcher —
-                    // invalidates it. The IRI is the file's only name (aliases are
-                    // refused above), so the write that changes the file is the one
-                    // that cuts this thread. All representations of the file
-                    // (string, raw bytes) share it.
-                    Ok(repr.cacheable().depends_on(iri))
-                } else {
-                    // Default: a file is a live fact, recomputed every read.
-                    Ok(repr)
-                }
+                Ok(self.source_answer(repr, iri))
             }
             Verb::Sink => {
-                let content = sink_content(inv)?;
-                found.write(&content, iri)?;
-                Ok(ack(format!("wrote {} bytes to {rel}", content.len())))
+                let written = sink(inv, found, iri).await?;
+                Ok(ack(format!("wrote {written} bytes to {rel}")))
             }
             Verb::Exists => {
                 let present = found.exists();
@@ -296,6 +348,29 @@ impl Endpoint for FileEndpoint {
                 "file endpoint does not support the {other:?} verb"
             ))),
         }
+    }
+
+    /// On the native backend a `Source` answers a seekable [`Body::Replay`]
+    /// backed by the file, not bound by [`MAX_FILE_SOURCE_BYTES`] (the caller's
+    /// run budget bounds whatever it collects). Each reader opens a fresh handle
+    /// through the same jailed, no-follow walk, reads chunks of at most 64 KiB,
+    /// and ends in [`Error::Conflict`] when the file changed while read. Every
+    /// other verb, and every verb on the `localStorage` backend, answers as
+    /// [`invoke`](Endpoint::invoke) does.
+    async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>> {
+        #[cfg(unix)]
+        if inv.request.verb == Verb::Source {
+            let Admitted {
+                iri,
+                leaf,
+                raw,
+                found,
+                ..
+            } = self.admit(inv)?;
+            let (repr_type, body) = found.body(leaf, raw, iri)?;
+            return Ok(self.source_answer(Representation::from_body(repr_type, body), iri));
+        }
+        self.invoke(inv).await.map(Representation::into_body)
     }
 
     fn name(&self) -> &str {
@@ -368,7 +443,14 @@ impl Endpoint for FileEndpoint {
                             .optional(),
                     )
                     .output("text/plain;charset=utf-8")
-                    .output(OCTET_STREAM),
+                    .output(OCTET_STREAM)
+                    // `permanent`: a refused path, a missing file, and the
+                    // `Conflict` a body ends with when the file changed while
+                    // read. `over-budget`: the bytes path's 16 MiB bound.
+                    // `unknown`: an I/O failure.
+                    .fails(FailureClass::Permanent)
+                    .fails(FailureClass::OverBudget)
+                    .fails(FailureClass::Unknown),
             )
             .action(
                 ActionSpec::new(Verb::Exists)
@@ -398,7 +480,13 @@ impl Endpoint for FileEndpoint {
                             .class(XSD_STRING),
                     )
                     .input(sink_encoding_arg())
-                    .output("text/plain;charset=utf-8"),
+                    .output("text/plain;charset=utf-8")
+                    // `permanent`: refused content or path, a `Conflict` from a
+                    // streamed content's source. `over-budget`: content past a
+                    // bound. `unknown`: an I/O failure.
+                    .fails(FailureClass::Permanent)
+                    .fails(FailureClass::OverBudget)
+                    .fails(FailureClass::Unknown),
             )
             .action(
                 ActionSpec::new(Verb::Delete)
@@ -544,29 +632,176 @@ fn sink_encoding_arg() -> ArgSpec {
         .default_value("utf-8")
 }
 
-fn sink_content<'a>(inv: &'a Invocation<'_>) -> Result<std::borrow::Cow<'a, [u8]>> {
-    use base64::Engine as _;
-    let encoding = if inv.request.args.contains_key("encoding") {
-        inv.inline_str("encoding")?
-    } else {
-        "utf-8"
-    };
-    match encoding {
-        "utf-8" => Ok(std::borrow::Cow::Borrowed(
-            inv.inline_str("content")?.as_bytes(),
-        )),
-        "base64" => base64::engine::general_purpose::STANDARD
-            .decode(inv.inline_arg("content")?)
-            .map(std::borrow::Cow::Owned)
-            .map_err(|_| Error::InvalidArgument {
-                name: "content".to_string(),
-                detail: "expected canonical standard-alphabet base64 with padding".to_string(),
-            }),
+/// How a Sink's `content` is encoded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    Utf8,
+    Base64,
+}
+
+/// The Sink's `encoding`, judged before any content is read.
+fn sink_encoding(inv: &Invocation<'_>) -> Result<Encoding> {
+    if !inv.request.args.contains_key("encoding") {
+        return Ok(Encoding::Utf8);
+    }
+    match inv.inline_str("encoding")? {
+        "utf-8" => Ok(Encoding::Utf8),
+        "base64" => Ok(Encoding::Base64),
         _ => Err(Error::InvalidArgument {
             name: "encoding".to_string(),
             detail: "expected utf-8 or base64".to_string(),
         }),
     }
+}
+
+fn not_utf8() -> Error {
+    Error::InvalidArgument {
+        name: "content".to_string(),
+        detail: "not valid UTF-8".to_string(),
+    }
+}
+
+fn not_base64() -> Error {
+    Error::InvalidArgument {
+        name: "content".to_string(),
+        detail: "expected canonical standard-alphabet base64 with padding".to_string(),
+    }
+}
+
+/// Content already in memory, decoded whole: the bytes to write.
+fn decode_whole(encoding: Encoding, content: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    use base64::Engine as _;
+    match encoding {
+        Encoding::Utf8 => std::str::from_utf8(content)
+            .map(|_| std::borrow::Cow::Borrowed(content))
+            .map_err(|_| not_utf8()),
+        Encoding::Base64 => base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .map(std::borrow::Cow::Owned)
+            .map_err(|_| not_base64()),
+    }
+}
+
+/// Streamed content, decoded **incrementally**, chunk by chunk, holding at most
+/// the few bytes a chunk boundary splits (a UTF-8 sequence, a base64 group): what
+/// is written is exactly what [`decode_whole`] would have produced from the
+/// whole, and anything [`decode_whole`] would refuse is refused, here or at
+/// [`finish`](Self::finish).
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Decoder {
+    encoding: Encoding,
+    /// The incomplete tail of the last chunk.
+    carry: Vec<u8>,
+    /// A padded base64 group was decoded: it must have been the last.
+    ended: bool,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl Decoder {
+    fn new(encoding: Encoding) -> Self {
+        Decoder {
+            encoding,
+            carry: Vec::new(),
+            ended: false,
+        }
+    }
+
+    /// Decode `chunk`, handing every complete decoded run to `out`.
+    fn feed(&mut self, chunk: &[u8], out: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        use base64::Engine as _;
+        let joined;
+        let data: &[u8] = if self.carry.is_empty() {
+            chunk
+        } else {
+            joined = [self.carry.as_slice(), chunk].concat();
+            &joined
+        };
+        let rest = match self.encoding {
+            Encoding::Utf8 => {
+                let valid = match std::str::from_utf8(data) {
+                    Ok(_) => data.len(),
+                    // `error_len() == None`: a sequence cut by the chunk's end.
+                    Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                    Err(_) => return Err(not_utf8()),
+                };
+                out(&data[..valid])?;
+                &data[valid..]
+            }
+            Encoding::Base64 => {
+                if self.ended && !data.is_empty() {
+                    return Err(not_base64());
+                }
+                let (groups, rest) = data.split_at(data.len() / 4 * 4);
+                if !groups.is_empty() {
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(groups)
+                        .map_err(|_| not_base64())?;
+                    out(&decoded)?;
+                    self.ended = groups.ends_with(b"=");
+                    if self.ended && !rest.is_empty() {
+                        return Err(not_base64());
+                    }
+                }
+                rest
+            }
+        };
+        self.carry = rest.to_vec();
+        Ok(())
+    }
+
+    /// The content ended: refuse it if it ended inside a sequence or a group.
+    fn finish(self) -> Result<()> {
+        if self.carry.is_empty() {
+            Ok(())
+        } else if self.encoding == Encoding::Utf8 {
+            Err(not_utf8())
+        } else {
+            Err(not_base64())
+        }
+    }
+}
+
+/// Write a Sink's `content` to the file the walk found, returning how many bytes
+/// were written.
+///
+/// The content is read with [`Invocation::content_body`], so it may be inline, a
+/// reference, or a content id. Content already in memory ([`Body::Bytes`]) is
+/// decoded whole before the disk is touched, as before bodies existed. A stream is
+/// decoded incrementally ([`Decoder`]) into the staging file chunk by chunk and
+/// published only once it ended cleanly: a stream that fails part-way, or content
+/// that does not decode, leaves the target untouched and no staging file behind.
+#[cfg(unix)]
+async fn sink(inv: &Invocation<'_>, found: backend::Found, iri: &str) -> Result<u64> {
+    let encoding = sink_encoding(inv)?;
+    let body = inv.content_body("content").await?;
+    if let Body::Bytes(bytes) = &body {
+        let content = decode_whole(encoding, bytes)?;
+        found.write(&content, iri)?;
+        return Ok(content.len() as u64);
+    }
+    let mut stream = body.into_stream();
+    let mut decoder = Decoder::new(encoding);
+    let mut staged = found.stage(iri)?;
+    let mut written = 0u64;
+    while let Some(chunk) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
+        decoder.feed(&chunk?, &mut |decoded| {
+            written += decoded.len() as u64;
+            staged.write_all(decoded, iri)
+        })?;
+    }
+    decoder.finish()?;
+    staged.publish(iri)?;
+    Ok(written)
+}
+
+/// The `localStorage` backend keeps today's behavior: `content` is inline, decoded
+/// whole, and stored with one `set_item`.
+#[cfg(not(unix))]
+async fn sink(inv: &Invocation<'_>, found: backend::Found, iri: &str) -> Result<u64> {
+    let encoding = sink_encoding(inv)?;
+    let content = decode_whole(encoding, inv.inline_arg("content")?)?;
+    found.write(&content, iri)?;
+    Ok(content.len() as u64)
 }
 
 /// Whether a `Source` asks for raw bytes. `as` is declared `one_of
@@ -1015,20 +1250,18 @@ mod backend {
         }
 
         pub(super) fn read(self, iri: &str) -> Result<Vec<u8>> {
+            let (fd, now) = self.open_judged(iri)?;
+            read_bounded(std::fs::File::from(fd), now.st_size, iri)
+        }
+
+        /// Open the leaf the walk judged, through the walk's parent handle and
+        /// without following a link, and confirm it is still that file.
+        fn open_judged(&self, iri: &str) -> Result<(OwnedFd, rfs::Stat)> {
             let Some(stat) = self.leaf.as_ref() else {
                 return Err(not_found(iri));
             };
             require_regular(stat, &self.shown())?;
-            let fd = rfs::openat(
-                &self.dir,
-                self.leaf_name(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                Mode::empty(),
-            )
-            .map_err(|e| match e {
-                Errno::LOOP | Errno::MLINK => link_refused_shown(&self.shown()),
-                e => io_error("read", iri, e),
-            })?;
+            let fd = open_leaf(&self.dir, self.leaf_name(), &self.shown(), iri)?;
             // The handle is the file judged: the same inode the walk found, still a
             // regular file. Anything else was swapped in since.
             let now = rfs::fstat(&fd).map_err(|e| io_error("read", iri, e))?;
@@ -1036,7 +1269,37 @@ mod backend {
                 return Err(changed(iri));
             }
             require_regular(&now, &self.shown())?;
-            read_bounded(std::fs::File::from(fd), now.st_size, iri)
+            Ok((fd, now))
+        }
+
+        /// A `Source` as a body: a [`FileReplay`] over the file the walk judged,
+        /// its version (size, inode, mtime, ctime) recorded now. The media type
+        /// follows [`source_type`]'s rules; where they need the bytes (no `as`, an
+        /// extension with no known type), a file within [`MAX_FILE_SOURCE_BYTES`]
+        /// is checked for UTF-8 by one bounded-chunk pass that holds no more than a
+        /// chunk, and a larger one is served as bytes.
+        pub(super) fn body(self, leaf: &str, raw: bool, iri: &str) -> Result<(ReprType, Body)> {
+            let (fd, at_open) = self.open_judged(iri)?;
+            let guessed = media_type_for(Path::new(leaf));
+            let repr_type = if raw {
+                ReprType::new(OCTET_STREAM)
+            } else if guessed.media_type != OCTET_STREAM
+                || at_open.st_size > MAX_FILE_SOURCE_BYTES as i64
+            {
+                guessed
+            } else if is_utf8(FileReader::new(fd, at_open, 0, iri))? {
+                ReprType::new("text/plain").with_param("charset", "utf-8")
+            } else {
+                guessed
+            };
+            let replay = FileReplay {
+                leaf: self.leaf_name().to_string(),
+                shown: self.shown(),
+                iri: iri.to_string(),
+                at_open,
+                dir: self.dir,
+            };
+            Ok((repr_type, Body::replay(replay)))
         }
 
         pub(super) fn write(self, bytes: &[u8], iri: &str) -> Result<()> {
@@ -1050,6 +1313,18 @@ mod backend {
             iri: &str,
             write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
         ) -> Result<()> {
+            let mut pending = self.stage(iri)?;
+            write(&mut pending.staged.file)
+                .map_err(|e| Error::Endpoint(format!("write `{iri}`: {e}")))?;
+            pending.publish(iri)
+        }
+
+        /// Prepare a write: create the missing directories, hold the old file, and
+        /// exclusively create a staging file in the opened parent. Nothing is
+        /// visible at the target until [`Pending::publish`]; dropping the
+        /// [`Pending`] instead removes the staging file and leaves the target as it
+        /// was.
+        pub(super) fn stage(self, iri: &str) -> Result<Pending> {
             let shown = self.shown();
             if self.blocked {
                 return Err(deny(&format!(
@@ -1108,11 +1383,56 @@ mod backend {
             };
 
             let mode = Mode::from_raw_mode(if self.leaf.is_some() { 0o600 } else { 0o666 });
-            let mut staged = Staged::create(&dir, mode, iri)?;
-            write(&mut staged.file).map_err(|e| Error::Endpoint(format!("write `{iri}`: {e}")))?;
+            let staged = Staged::create(dir, mode, iri)?;
+            Ok(Pending {
+                staged,
+                leaf: leaf.to_string(),
+                names: self.names,
+                expected: self.leaf,
+                old,
+            })
+        }
+    }
+
+    /// A staged write ([`Found::stage`]): the staging file, open for writing, and
+    /// what publication checks before it makes the file visible.
+    pub(super) struct Pending {
+        staged: Staged,
+        leaf: String,
+        names: Vec<String>,
+        /// The file the walk judged, when one was there.
+        expected: Option<rfs::Stat>,
+        /// A handle on that file, held until publication.
+        old: Option<OwnedFd>,
+    }
+
+    impl Pending {
+        /// Append `bytes` to the staging file.
+        pub(super) fn write_all(&mut self, bytes: &[u8], iri: &str) -> Result<()> {
+            self.staged
+                .file
+                .write_all(bytes)
+                .map_err(|e| Error::Endpoint(format!("write `{iri}`: {e}")))
+        }
+
+        /// Sync the staging file and publish it at the target: `renameat` over an
+        /// existing file (an open reader keeps the old inode and its bytes), or
+        /// `linkat` for a new one (never overwriting a name that appeared since).
+        pub(super) fn publish(self, iri: &str) -> Result<()> {
+            let Pending {
+                staged,
+                leaf,
+                names,
+                expected,
+                old,
+            } = self;
+            let shown = names.join("/");
+            let all: Vec<&str> = names.iter().map(String::as_str).collect();
+            let leaf = leaf.as_str();
+            let dir = &staged.dir;
             // Preserve ordinary permission bits on replacement, without carrying
             // set-id bits onto new content. New files retain 0666 filtered by umask.
-            if let Some(expected) = &self.leaf {
+            if let Some(expected) = &expected {
                 rfs::fchmod(&staged.file, Mode::from_raw_mode(expected.st_mode & 0o777))
                     .map_err(|e| io_error("set permissions for", iri, e))?;
             }
@@ -1124,30 +1444,30 @@ mod backend {
             // The temporary name must still refer to the regular inode written
             // through our handle, rather than an entry substituted during I/O.
             let staged_stat = rfs::fstat(&staged.file).map_err(|e| io_error("publish", iri, e))?;
-            let named_stat = rfs::statat(&dir, staged.name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            let named_stat = rfs::statat(dir, staged.name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|e| io_error("publish", iri, e))?;
             require_regular(&named_stat, &shown)?;
             if staged_stat.st_ino != named_stat.st_ino || staged_stat.st_dev != named_stat.st_dev {
                 return Err(changed(iri));
             }
 
-            if let Some(expected) = &self.leaf {
+            if let Some(expected) = &expected {
                 // Revalidate after staging: a new inode or symlink planted while
                 // bytes were being written must not be adopted by this request.
-                let now = rfs::statat(&dir, leaf, AtFlags::SYMLINK_NOFOLLOW)
+                let now = rfs::statat(dir, leaf, AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(|e| io_error("write", iri, e))?;
                 require_regular(&now, &shown)?;
                 if now.st_ino != expected.st_ino || now.st_dev != expected.st_dev {
                     return Err(changed(iri));
                 }
-                check_spelling(&dir, leaf, now.st_ino, &all)?;
-                rfs::renameat(&dir, staged.name.as_str(), &dir, leaf)
+                check_spelling(dir, leaf, now.st_ino, &all)?;
+                rfs::renameat(dir, staged.name.as_str(), dir, leaf)
                     .map_err(|e| io_error("publish", iri, e))?;
             } else {
                 // Portable exclusive publication: link a complete file into place.
                 // Unlike rename, linkat cannot overwrite a name that appeared
                 // since the probe. Drop removes only the temporary second name.
-                rfs::linkat(&dir, staged.name.as_str(), &dir, leaf, AtFlags::empty()).map_err(
+                rfs::linkat(dir, staged.name.as_str(), dir, leaf, AtFlags::empty()).map_err(
                     |e| match e {
                         Errno::EXIST => changed(iri),
                         e => io_error("publish", iri, e),
@@ -1157,7 +1477,9 @@ mod backend {
             drop(old);
             Ok(())
         }
+    }
 
+    impl Found {
         pub(super) fn delete(self, iri: &str) -> Result<()> {
             let Some(stat) = &self.leaf else {
                 return Err(not_found(iri));
@@ -1176,17 +1498,209 @@ mod backend {
         }
     }
 
+    /// The largest chunk a [`FileReplay`] reader yields.
+    const CHUNK: u64 = 64 * 1024;
+
+    /// A file `Source` as a [`Replay`](ikigai_core::Replay) (ledger #2245).
+    ///
+    /// It holds the handle on the leaf's parent that the jailed walk opened, and
+    /// the file's version at open. Every reader opens a fresh descriptor for the
+    /// leaf through that handle without following a link — never a host path that
+    /// re-walks the jail — and is refused unless it is the same file, unchanged.
+    /// It reads chunks of at most [`CHUNK`] bytes, each poll one bounded blocking
+    /// read on the polling thread, as the crate does all of its file I/O; and at
+    /// the end it checks the version again ([`same_version`]). **A file changed
+    /// while read** (size, inode, mtime or ctime moved; a write in place, a
+    /// replacement since the body was opened) **ends the stream with
+    /// [`Error::Conflict`]**, never a short or
+    /// mixed body. A reader already open when a `Sink` replaces the file keeps the
+    /// old inode, so it reads the old bytes whole.
+    ///
+    /// A cached body (a [`cacheable`](super::FileEndpoint::cacheable) mount) keeps
+    /// its parent handle open until the cache lets it go.
+    struct FileReplay {
+        dir: OwnedFd,
+        leaf: String,
+        shown: String,
+        iri: String,
+        at_open: rfs::Stat,
+    }
+
+    impl FileReplay {
+        fn reader(&self, offset: u64) -> FileReader {
+            let fresh = open_leaf(&self.dir, &self.leaf, &self.shown, &self.iri).and_then(|fd| {
+                let now = rfs::fstat(&fd).map_err(|e| io_error("read", &self.iri, e))?;
+                if same_version(&now, &self.at_open) {
+                    Ok(fd)
+                } else {
+                    Err(changed_while_read(&self.iri))
+                }
+            });
+            match fresh {
+                Ok(fd) => FileReader::new(fd, self.at_open, offset, &self.iri),
+                Err(Error::NotFound(_)) => FileReader::failed(changed_while_read(&self.iri)),
+                Err(e) => FileReader::failed(e),
+            }
+        }
+    }
+
+    impl ikigai_core::Replay for FileReplay {
+        fn open(&self) -> ikigai_core::ByteStream {
+            Box::pin(self.reader(0))
+        }
+
+        /// A reader from byte `offset`; past the end it yields nothing (still
+        /// checked for a change at its end).
+        fn open_at(&self, offset: u64) -> Option<ikigai_core::ByteStream> {
+            Some(Box::pin(self.reader(offset)))
+        }
+
+        fn len_hint(&self) -> Option<u64> {
+            u64::try_from(self.at_open.st_size).ok()
+        }
+    }
+
+    /// One reader of a [`FileReplay`]: a fresh descriptor, how many bytes the
+    /// version at open leaves to read, and that version to check at the end.
+    struct FileReader {
+        /// The descriptor and the version it must still be at its end; `None`
+        /// once the stream ended.
+        file: Option<(std::fs::File, rfs::Stat)>,
+        remaining: u64,
+        iri: String,
+        failed: Option<Error>,
+    }
+
+    impl FileReader {
+        fn new(fd: OwnedFd, expected: rfs::Stat, offset: u64, iri: &str) -> Self {
+            use std::io::{Seek, SeekFrom};
+            let size = u64::try_from(expected.st_size).unwrap_or(0);
+            let mut file = std::fs::File::from(fd);
+            let mut reader = FileReader {
+                file: None,
+                remaining: size.saturating_sub(offset),
+                iri: iri.to_string(),
+                failed: None,
+            };
+            match file.seek(SeekFrom::Start(offset)) {
+                Ok(_) => reader.file = Some((file, expected)),
+                Err(e) => reader.failed = Some(Error::Endpoint(format!("read `{iri}`: {e}"))),
+            }
+            reader
+        }
+
+        fn failed(error: Error) -> Self {
+            FileReader {
+                file: None,
+                remaining: 0,
+                iri: String::new(),
+                failed: Some(error),
+            }
+        }
+
+        /// The next chunk, the error that ends the stream, or `None` at a clean end.
+        fn next_chunk(&mut self) -> Option<Result<ikigai_core::Bytes>> {
+            if let Some(error) = self.failed.take() {
+                return Some(Err(error));
+            }
+            let (file, expected) = self.file.as_mut()?;
+            // One byte past what is left, so growth shows without a second read.
+            let mut buf = vec![0u8; (self.remaining.min(CHUNK - 1) + 1) as usize];
+            let read = loop {
+                match file.read(&mut buf) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    other => break other,
+                }
+            };
+            match read {
+                Ok(0) => {
+                    let unchanged = self.remaining == 0
+                        && rfs::fstat(&*file).is_ok_and(|now| same_version(&now, expected));
+                    self.file = None;
+                    (!unchanged).then(|| Err(changed_while_read(&self.iri)))
+                }
+                Ok(n) if n as u64 > self.remaining => {
+                    self.file = None;
+                    Some(Err(changed_while_read(&self.iri)))
+                }
+                Ok(n) => {
+                    self.remaining -= n as u64;
+                    buf.truncate(n);
+                    Some(Ok(buf.into()))
+                }
+                Err(e) => {
+                    self.file = None;
+                    Some(Err(Error::Endpoint(format!("read `{}`: {e}", self.iri))))
+                }
+            }
+        }
+    }
+
+    impl futures_core::Stream for FileReader {
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.get_mut().next_chunk())
+        }
+
+        type Item = Result<ikigai_core::Bytes>;
+    }
+
+    /// Whether the file a reader reads is valid UTF-8, read once in bounded
+    /// chunks. A change while read is the reader's [`Error::Conflict`].
+    fn is_utf8(mut reader: FileReader) -> Result<bool> {
+        let mut decoder = Decoder::new(Encoding::Utf8);
+        while let Some(chunk) = reader.next_chunk() {
+            if decoder.feed(&chunk?, &mut |_| Ok(())).is_err() {
+                return Ok(false);
+            }
+        }
+        Ok(decoder.finish().is_ok())
+    }
+
+    /// Whether two stats are one version of one file: same inode, size and mtime,
+    /// and same ctime unless the link count moved. A write moves mtime and ctime;
+    /// resetting mtime afterwards moves ctime again. A link count that changed
+    /// (a `Sink` renaming a new file over this one, a hard link made) moves ctime
+    /// without touching the bytes, so an open reader of a replaced file still
+    /// reads its old bytes whole.
+    fn same_version(a: &rfs::Stat, b: &rfs::Stat) -> bool {
+        a.st_dev == b.st_dev
+            && a.st_ino == b.st_ino
+            && a.st_size == b.st_size
+            && a.st_mtime == b.st_mtime
+            && a.st_mtime_nsec == b.st_mtime_nsec
+            && (a.st_nlink != b.st_nlink
+                || (a.st_ctime == b.st_ctime && a.st_ctime_nsec == b.st_ctime_nsec))
+    }
+
+    /// Open the leaf `name` in the walk's directory `dir` for reading, never
+    /// following a link.
+    fn open_leaf(dir: &OwnedFd, name: &str, shown: &str, iri: &str) -> Result<OwnedFd> {
+        rfs::openat(
+            dir,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            Errno::LOOP | Errno::MLINK => link_refused_shown(shown),
+            e => io_error("read", iri, e),
+        })
+    }
+
     /// A staging file in the *opened* parent, never a host path that re-walks
     /// the jail. Exclusive creation refuses collisions and Drop cleans every
     /// ordinary error path (a killed process can leave an unpublished orphan).
-    struct Staged<'a> {
-        dir: &'a OwnedFd,
+    struct Staged {
+        dir: OwnedFd,
         name: String,
         file: std::fs::File,
     }
 
-    impl<'a> Staged<'a> {
-        fn create(dir: &'a OwnedFd, mode: Mode, iri: &str) -> Result<Self> {
+    impl Staged {
+        fn create(dir: OwnedFd, mode: Mode, iri: &str) -> Result<Self> {
             for _ in 0..16 {
                 let mut random = [0u8; 16];
                 getrandom::fill(&mut random).map_err(|_| {
@@ -1194,7 +1708,7 @@ mod backend {
                 })?;
                 let name = format!(".ikigai-fs-{:032x}.tmp", u128::from_ne_bytes(random));
                 match rfs::openat(
-                    dir,
+                    &dir,
                     name.as_str(),
                     OFlags::WRONLY
                         | OFlags::CREATE
@@ -1220,9 +1734,9 @@ mod backend {
         }
     }
 
-    impl Drop for Staged<'_> {
+    impl Drop for Staged {
         fn drop(&mut self) {
-            let _ = rfs::unlinkat(self.dir, self.name.as_str(), AtFlags::empty());
+            let _ = rfs::unlinkat(&self.dir, self.name.as_str(), AtFlags::empty());
         }
     }
 
@@ -1348,6 +1862,12 @@ mod backend {
 
     fn not_found(iri: &str) -> Error {
         Error::NotFound(format!("`{iri}` does not exist"))
+    }
+
+    /// A body's file changed between its open and a reader's end (the
+    /// [`Replay`](ikigai_core::Replay) contract).
+    fn changed_while_read(iri: &str) -> Error {
+        Error::Conflict(format!("`{iri}` changed while read; read it again"))
     }
 
     fn changed(iri: &str) -> Error {
