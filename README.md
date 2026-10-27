@@ -166,6 +166,44 @@ answers are cached under a golden thread named after the resource, and a
 `Sink`/`Delete` through the kernel cuts it. Out-of-band changes are not seen
 until something cuts the thread, so use it for a root written through ikigai.
 
+## Spilling (since 0.2.2)
+
+`FileSpill` is the file-backed **spill facility** (ledger #2241, the seam is
+`ikigai_core::Spill`, core 0.2.1): installed on a kernel, it lets the sealed
+builtin `urn:stream:spill` write a one-shot body to a file and answer it as a
+body that can be read again. Unix only; the `wasm32` backend installs none, and
+`urn:stream:spill` there answers `Unsupported`.
+
+```rust
+use std::sync::Arc;
+use ikigai_fs::FileSpill;
+
+// A directory of the host's own, under its config home; it must already exist.
+let spill = FileSpill::new(config_home.join("spill"))?;
+let kernel = Kernel::new(Arc::new(root_space)).with_spill(Arc::new(spill));
+// A caller now needs a `urn:cap:stream:spill:<bytes>` grant (`cap_stream_spill`)
+// to spill, and may write at most that many bytes.
+```
+
+- **The host supplies the directory.** ikigai-fs never reads an environment
+  variable (no `TMPDIR`) and never picks one itself. The directory is opened once
+  and every spill file is created relative to that handle: exclusively
+  (`O_EXCL | O_NOFOLLOW | O_CLOEXEC`), mode `0600`, named
+  `.ikigai-spill-<32 hex digits>`.
+- **A spill** reads the body chunk by chunk, writing and hashing each chunk.
+  Past `max_bytes` it stops, removes the file and answers `OverBudget`, never a
+  shorter body; a body that ends in an error removes the file and answers that
+  error.
+- **The answer** is a seekable `Replay`: `open` and `open_at` each give a fresh
+  reader of chunks of at most 64 KiB on its own descriptor, `len_hint` is the
+  byte count and `validator` is the bytes' content id. The file is never written
+  again, and is **deleted when the last holder drops the answer**; a reader still
+  open then finishes (the unlinked file lives while it is open).
+- **Orphans.** A killed process leaves its spill files behind; `FileSpill::new`
+  removes the regular files named `.ikigai-spill-*` in its directory, and nothing
+  else. So **two processes must not share one spill directory**: each would
+  remove the other's live files. Give each host process its own.
+
 ## Conformance
 
 The module **passes
@@ -200,7 +238,15 @@ One crate, a `cfg`-gated backend.
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
 
-## 0.2.1 (unreleased)
+## 0.2.2 (unreleased)
+
+- `FileSpill`, the file-backed spill facility for `urn:stream:spill` (ledger
+  #2241, part of the streams arc #2228), and `SPILL_PREFIX`, the prefix of its
+  files' names. Unix only; see "Spilling" above. Additive.
+- `ikigai-core` pin raised to `0.2.1`, the true minimum: `Spill`,
+  `ContentHasher` and `Kernel::with_spill` are new there.
+
+## 0.2.1
 
 - Bodies on the native backend (ledger #2245, part of the streams arc #2228):
   `Source` answers a seekable `Replay` backed by the file that refuses torn bytes
