@@ -121,6 +121,14 @@
 //! `wasm32` `localStorage` backend keeps answering a buffer and taking inline
 //! content.
 //!
+//! ## Spilling
+//!
+//! On Unix, [`FileSpill`] is the file-backed spill facility (ledger #2241): a host
+//! installs it with [`Kernel::with_spill`](ikigai_core::Kernel::with_spill), over a
+//! directory the host supplies, and `urn:stream:spill` then writes a one-shot body to
+//! a file there and answers it as a seekable body known by its content id, removed
+//! when its last holder drops it. The `wasm32` backend installs no facility.
+//!
 //! ## Platforms
 //!
 //! One crate, a `cfg`-gated backend. The native backend (Unix) resolves through
@@ -132,6 +140,11 @@
 //! backend is text-oriented (it refuses non-UTF-8 writes). Any other native
 //! platform has no handle-relative walk here and **refuses every request**
 //! rather than serve one unconfined.
+
+#[cfg(unix)]
+mod spill;
+#[cfg(unix)]
+pub use spill::{FileSpill, SPILL_PREFIX};
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -1919,6 +1932,10 @@ mod backend {
 /// prefer that entry, falling back to the original text key for existing stores.
 /// Separate keys avoid interpreting any legacy text as a binary format marker;
 /// the encoding is internal and Source still returns the stored bytes.
+///
+/// It installs no spill facility: there is no file system to spill to, so a browser
+/// host's `urn:stream:spill` answers `Unsupported` (the file-backed `FileSpill` is
+/// Unix only).
 #[cfg(target_family = "wasm")]
 mod backend {
     use super::*;
