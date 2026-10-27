@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-fs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Capability-gated file/store ikigai module: jailed to a root with a default-deny path-ACL; SOURCE/SINK/EXISTS/DELETE. A cfg-gated backend links into native (std::fs) and wasm32 (browser localStorage) hosts from one crate."
@@ -30,6 +30,9 @@ base64 = "0.22"
 rustix = { version = "1.0", features = ["fs"] }
 # Unpredictable names for exclusively-created, handle-relative staging files.
 getrandom = "0.3"
+# The `Stream` a file `Replay` reader implements, and a streamed Sink polls: the
+# same futures-core `ikigai_core::ByteStream` is built on.
+futures-core = "0.3"
 
 # Browser backend: localStorage via web-sys. wasm32-only — native hosts don't pull
 # it, so the `std::fs` path stays dependency-light.

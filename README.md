@@ -109,6 +109,38 @@ the read is also bounded to catch growth. A file above the limit returns typed
 The limit applies per read, including cacheable mounts; it does not bound total
 cache memory or concurrent reads. Browser localStorage retains its storage quota.
 
+### Bodies (since 0.2.1)
+
+On the native backend the endpoint also answers and accepts **streamed bodies**
+(`ikigai-core` 0.2.0's `Body`), so a 2 GB file is neither read into memory nor
+written from one:
+
+- **`Source` answers a seekable `Body::Replay`** (`Endpoint::invoke_body`, which
+  the kernel calls). Every reader (`open`, `open_at(offset)`) opens a fresh
+  descriptor through the same jailed, no-follow walk, yields chunks of at most
+  64 KiB, and knows the length (`len_hint`, the size at open). The 16 MiB limit
+  above is the **bytes path's** (`invoke`); the body path is not bound by it, and
+  a caller that collects the body (the kernel's bytes API) is bounded by its
+  run's byte budget instead (64 MiB by default; refused, never truncated).
+- **Torn bytes are refused.** The file's size, inode, mtime and ctime are
+  recorded at open and checked again when each reader opens and ends; a file
+  changed while read ends the stream with `Conflict` ("changed while read"), never
+  a short or mixed body. A reader already open when a `Sink` replaces the file
+  keeps the old inode and reads the old bytes whole.
+- **`Sink` streams** its `content` (`Invocation::content_body`: inline, a
+  reference, or a content id) chunk by chunk into the staging file, then
+  publishes it as above. `encoding=base64` and the UTF-8 check are decoded
+  **incrementally**, never collected. A stream that fails part-way, or content
+  that does not decode, leaves the target untouched and no staging file behind.
+- The `Source` and `Sink` actions state their failure classes (`permanent`, which
+  covers `Conflict`; `over-budget`; `unknown`), so conformance's FAILURES check
+  compares them.
+
+Where the media type needs the bytes (no `as`, an extension with no known type),
+a file within 16 MiB is checked for UTF-8 by one bounded-chunk pass; a larger one
+is served as `application/octet-stream`. The `wasm32` localStorage backend keeps
+its behavior: `Source` answers a buffer, and `Sink` takes inline content.
+
 A missing file is the typed `NotFound` (for `Source` and `Delete`; `Exists`
 answers `false`). Errors name the request's IRI, never the host path behind it.
 A failed check is an error, never a `false`.
@@ -167,6 +199,18 @@ One crate, a `cfg`-gated backend.
   meaning on Windows is refused before that, as a path, on every platform, so a
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
+
+## 0.2.1 (unreleased)
+
+- Bodies on the native backend (ledger #2245, part of the streams arc #2228):
+  `Source` answers a seekable `Replay` backed by the file that refuses torn bytes
+  with `Conflict`; `Sink` streams `content` through the staging file, decoding
+  UTF-8 and base64 incrementally, and now also accepts content by reference or
+  content id. See "Bodies" above. Additive: no public API changes.
+- A kernel caller of the bytes API now reads a file past 16 MiB when its run's
+  byte budget covers it (the kernel collects the body); `invoke` itself keeps the
+  16 MiB bound.
+- `Source` and `Sink` state their failure classes.
 
 ## 0.2.0 (2026-10-26)
 
