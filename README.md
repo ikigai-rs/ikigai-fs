@@ -272,6 +272,10 @@ One crate, a `cfg`-gated backend.
   reference or content id.
 - `ikigai-core` pin raised to `0.2.3`, the first release with
   `ArgSpec::reads_body`. No other dependency moves.
+- A file `Source` body states a strong validator, the content id of its bytes,
+  hashed once per file version and remembered (ledger #2474); `VALIDATOR_SETTLE`,
+  how old a file's last change must be before it states one. See "Bodies" above.
+  Additive.
 
 ## 0.2.2
 
@@ -280,10 +284,6 @@ One crate, a `cfg`-gated backend.
   files' names. Unix only; see "Spilling" above. Additive.
 - `ikigai-core` pin raised to `0.2.1`, the true minimum: `Spill`,
   `ContentHasher` and `Kernel::with_spill` are new there.
-- A file `Source` body states a strong validator, the content id of its bytes,
-  hashed once per file version and remembered (ledger #2474); `VALIDATOR_SETTLE`,
-  how old a file's last change must be before it states one. See "Bodies" above.
-  Additive.
 
 ## 0.2.1
 
