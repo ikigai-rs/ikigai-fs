@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-fs"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Capability-gated file/store ikigai module: jailed to a root with a default-deny path-ACL; SOURCE/SINK/EXISTS/DELETE. A cfg-gated backend links into native (std::fs) and wasm32 (browser localStorage) hosts from one crate."
@@ -18,7 +18,9 @@ categories = ["filesystem", "wasm"]
 # <0.2.0 under 0.x caret rules, so consumers must move with the core API.
 # 0.2.1 is the true minimum: `Spill`, `ContentHasher` and `Kernel::with_spill`, which
 # `FileSpill` implements and uses (ledger #2372, #2241), are new there.
-ikigai-core = "0.2.1"
+# 0.2.3 is the first release with `ArgSpec::reads_body` (ledger #2402), which the Sink
+# declares on `content` so an attached body streams to disk (ledger #2469).
+ikigai-core = "0.2.3"
 async-trait = "0.1"
 # Same vetted RFC 4648 implementation/profile as ikigai-http::base64.
 base64 = "0.22"

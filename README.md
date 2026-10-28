@@ -141,6 +141,13 @@ written from one:
   publishes it as above. `encoding=base64` and the UTF-8 check are decoded
   **incrementally**, never collected. A stream that fails part-way, or content
   that does not decode, leaves the target untouched and no staging file behind.
+- **`content` is read as a body** (since 0.2.3): the `Sink` action declares
+  `ArgSpec::reads_body` on it, so a body a host attaches
+  (`BodyIssue::attach`, what `| sink urn:file:x` runs through) streams into the
+  staging file while its producer is still producing, rather than being collected
+  by the kernel under the run's byte budget first. Such a write is therefore not
+  bounded by that budget; a producer that refuses part-way (`OverBudget` past
+  its own budget, or any other error) leaves nothing behind, as above.
 - The `Source` and `Sink` actions state their failure classes (`permanent`, which
   covers `Conflict`; `over-budget`; `unknown`), so conformance's FAILURES check
   compares them.
@@ -148,7 +155,9 @@ written from one:
 Where the media type needs the bytes (no `as`, an extension with no known type),
 a file within 16 MiB is checked for UTF-8 by one bounded-chunk pass; a larger one
 is served as `application/octet-stream`. The `wasm32` localStorage backend keeps
-its behavior: `Source` answers a buffer, and `Sink` takes inline content.
+its behavior: `Source` answers a buffer, and `Sink` collects its content under
+the run's byte budget (refused past it, never truncated) and stores it with one
+`set_item`.
 
 A missing file is the typed `NotFound` (for `Source` and `Delete`; `Exists`
 answers `false`). Errors name the request's IRI, never the host path behind it.
@@ -247,7 +256,24 @@ One crate, a `cfg`-gated backend.
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
 
-## 0.2.2 (unreleased)
+## 0.2.3 (unreleased)
+
+- **The `Sink` action declares `content` read as a body** (ledger #2469, after
+  core's #2402): an attached body streams to disk instead of the kernel
+  collecting it first, so a piped write is no longer refused past the run's byte
+  budget. **This moves the Sink's contract IRI**
+  (`urn:ikigai:contract:file:sink:b3:…`): the digest now includes the set of
+  inputs read as a body. Anything that pinned or cached the 0.2.2 Sink contract
+  IRI sees a new one; the `Source`, `Exists` and `Delete` contracts are unchanged.
+  Inline content, a `b3:` content id and an attached body write identical files.
+- The `wasm32` `localStorage` Sink now reads `content` with `content_body` and
+  collects it under the run's byte budget, which the kernel used to do for it, so
+  both backends keep the one contract. It therefore also accepts content by
+  reference or content id.
+- `ikigai-core` pin raised to `0.2.3`, the first release with
+  `ArgSpec::reads_body`. No other dependency moves.
+
+## 0.2.2
 
 - `FileSpill`, the file-backed spill facility for `urn:stream:spill` (ledger
   #2241, part of the streams arc #2228), and `SPILL_PREFIX`, the prefix of its
