@@ -127,6 +127,15 @@ written from one:
   changed while read ends the stream with `Conflict` ("changed while read"), never
   a short or mixed body. A reader already open when a `Sink` replaces the file
   keeps the old inode and reads the old bytes whole.
+- **A strong validator** (`Replay::validator`, ledger #2474): the content id of
+  the file's bytes, so the web door sends a large file with an `ETag` and answers
+  `304`, `If-Range` and `206` over it. The digest costs one full read, the first
+  time it is asked for, and is remembered process-wide against the file's version
+  (device, inode, size, nanosecond mtime and ctime), so later bodies over the
+  unchanged file state it without reading. A file changed less than
+  `VALIDATOR_SETTLE` (2 s) ago states none yet: a second same-length write in the
+  same timestamp tick would not move its version, so a digest taken between the
+  two could go stale unseen.
 - **`Sink` streams** its `content` (`Invocation::content_body`: inline, a
   reference, or a content id) chunk by chunk into the staging file, then
   publishes it as above. `encoding=base64` and the UTF-8 check are decoded
@@ -263,6 +272,10 @@ One crate, a `cfg`-gated backend.
   reference or content id.
 - `ikigai-core` pin raised to `0.2.3`, the first release with
   `ArgSpec::reads_body`. No other dependency moves.
+- A file `Source` body states a strong validator, the content id of its bytes,
+  hashed once per file version and remembered (ledger #2474); `VALIDATOR_SETTLE`,
+  how old a file's last change must be before it states one. See "Bodies" above.
+  Additive.
 
 ## 0.2.2
 

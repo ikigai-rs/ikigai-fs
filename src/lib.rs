@@ -123,6 +123,15 @@
 //! kernel first (ledger #2469). The `wasm32` `localStorage` backend keeps
 //! answering a buffer, and collects a `Sink`'s content under the run's byte budget.
 //!
+//! A file body states a strong validator (ledger #2474): the [`ContentId`] of its
+//! bytes, so an HTTP door can send an `ETag`, `304` and byte ranges for it. The
+//! digest costs one full read, done the first time it is asked for and remembered
+//! process-wide against the file's version (device, inode, size, and nanosecond
+//! mtime and ctime); asked again of the same version, it is a lookup. A file whose
+//! last change is less than [`VALIDATOR_SETTLE`] old states none yet.
+//!
+//! [`ContentId`]: ikigai_core::ContentId
+//!
 //! ## Spilling
 //!
 //! On Unix, [`FileSpill`] is the file-backed spill facility (ledger #2241): a host
@@ -170,6 +179,20 @@ pub const FILE_TEMPLATE: &str = "urn:file:{path}";
 /// This bounds each read, not the aggregate memory held by concurrent requests
 /// or cached representations. Browser localStorage uses its own storage quota.
 pub const MAX_FILE_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// How old a file's last change (its ctime) must be before its body states a
+/// validator: 2 s.
+///
+/// The validator is the digest of the bytes, remembered against the file's
+/// version, which is only as fine as the file system's timestamps. A second
+/// same-length write within the same timestamp tick as the first leaves the
+/// version unchanged, so a digest taken between them would be stale with nothing
+/// to show it (git's "racily clean" index entries). Past this much time any later
+/// write gets a later ctime; inside it the body states no validator, and a door
+/// serves it whole, without an `ETag`, as before. Two seconds covers the coarsest
+/// common granularity (FAT's two-second times) and small clock skew to a network
+/// file server.
+pub const VALIDATOR_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The datatype every input of this module carries: a root-relative path, a
 /// media type, encoding, and content all arrive as strings on the wire and in
@@ -1320,6 +1343,7 @@ mod backend {
                 iri: iri.to_string(),
                 at_open,
                 dir: self.dir,
+                validator: std::sync::OnceLock::new(),
             };
             Ok((repr_type, Body::replay(replay)))
         }
@@ -1538,6 +1562,10 @@ mod backend {
     /// mixed body. A reader already open when a `Sink` replaces the file keeps the
     /// old inode, so it reads the old bytes whole.
     ///
+    /// Its [`validator`](ikigai_core::Replay::validator) is the content id of the
+    /// version at open, hashed by one such reader the first time it is asked for
+    /// and remembered ([`validators`]); see [`VALIDATOR_SETTLE`].
+    ///
     /// A cached body (a [`cacheable`](super::FileEndpoint::cacheable) mount) keeps
     /// its parent handle open until the cache lets it go.
     struct FileReplay {
@@ -1546,6 +1574,7 @@ mod backend {
         shown: String,
         iri: String,
         at_open: rfs::Stat,
+        validator: std::sync::OnceLock<ikigai_core::ContentId>,
     }
 
     impl FileReplay {
@@ -1580,6 +1609,96 @@ mod backend {
         fn len_hint(&self) -> Option<u64> {
             u64::try_from(self.at_open.st_size).ok()
         }
+
+        /// The content id of the version at open (ledger #2474). Strong by
+        /// construction (RFC 9110 §8.8.1): it is the digest of exactly the bytes a
+        /// reader of this body serves, hashed by such a reader, so it fails, and
+        /// nothing is stated, if the file changed while hashed. Remembered against
+        /// the version, the only cost is the first full read of each version. `None`
+        /// while the file's last change is younger than [`VALIDATOR_SETTLE`], or when
+        /// the read fails.
+        fn validator(&self) -> Option<ikigai_core::ContentId> {
+            if let Some(id) = self.validator.get() {
+                return Some(*id);
+            }
+            let changed = std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(
+                u64::try_from(self.at_open.st_ctime).ok()?,
+                u32::try_from(self.at_open.st_ctime_nsec).ok()?,
+            ))?;
+            // Settled measured before the read, so the bytes hashed are no older than
+            // a version that had already stood for the whole window.
+            let settled = std::time::SystemTime::now()
+                .duration_since(changed)
+                .is_ok_and(|age| age >= VALIDATOR_SETTLE);
+            if !settled {
+                return None;
+            }
+            let key = Version::of(&self.at_open);
+            let known = validators().lock().ok()?.get(&key).copied();
+            let id = match known {
+                Some(id) => id,
+                None => {
+                    let id = digest(self.reader(0)).ok()?;
+                    let mut held = validators().lock().ok()?;
+                    if held.len() >= MAX_VALIDATORS {
+                        held.clear();
+                    }
+                    held.insert(key, id);
+                    id
+                }
+            };
+            Some(*self.validator.get_or_init(|| id))
+        }
+    }
+
+    /// How many file versions' digests [`validators`] remembers; past it they are
+    /// forgotten together, and hashed again when next asked for.
+    const MAX_VALIDATORS: usize = 4096;
+
+    /// A file's version as [`validators`] keys it: every stamp a change to its
+    /// bytes moves. ctime is the one a writer cannot set back.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    struct Version {
+        dev: u64,
+        ino: u64,
+        size: i64,
+        mtime: (i64, i64),
+        ctime: (i64, i64),
+    }
+
+    impl Version {
+        #[allow(clippy::unnecessary_cast)] // the stat fields' widths vary by target
+        fn of(stat: &rfs::Stat) -> Self {
+            Version {
+                dev: stat.st_dev as u64,
+                ino: stat.st_ino as u64,
+                size: stat.st_size as i64,
+                mtime: (stat.st_mtime as i64, stat.st_mtime_nsec as i64),
+                ctime: (stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+            }
+        }
+    }
+
+    /// The content ids of the file versions hashed so far, process-wide: a second
+    /// body over an unchanged file, or a second mount of it, states its validator
+    /// without reading it again. Only settled versions ([`VALIDATOR_SETTLE`]) are
+    /// entered, so a reused inode is a new ctime and never finds an old digest.
+    fn validators(
+    ) -> &'static std::sync::Mutex<std::collections::HashMap<Version, ikigai_core::ContentId>> {
+        static HELD: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<Version, ikigai_core::ContentId>>,
+        > = std::sync::OnceLock::new();
+        HELD.get_or_init(Default::default)
+    }
+
+    /// The content id of everything `reader` reads; its error (a change while read
+    /// is [`Error::Conflict`]) when the read fails.
+    fn digest(mut reader: FileReader) -> Result<ikigai_core::ContentId> {
+        let mut hasher = ikigai_core::ContentHasher::new();
+        while let Some(chunk) = reader.next_chunk() {
+            hasher.update(&chunk?);
+        }
+        Ok(hasher.finish())
     }
 
     /// One reader of a [`FileReplay`]: a fresh descriptor, how many bytes the
