@@ -118,8 +118,10 @@
 //! body. A `Sink` reads its content with [`Invocation::content_body`] and writes
 //! it chunk by chunk into the staging file, decoding UTF-8 and base64
 //! incrementally; a stream that fails part-way leaves the target untouched. The
-//! `wasm32` `localStorage` backend keeps answering a buffer and taking inline
-//! content.
+//! `Sink` action declares `content` [`ArgSpec::reads_body`], so a body a host
+//! attaches streams into the staging file rather than being collected by the
+//! kernel first (ledger #2469). The `wasm32` `localStorage` backend keeps
+//! answering a buffer, and collects a `Sink`'s content under the run's byte budget.
 //!
 //! ## Spilling
 //!
@@ -487,10 +489,14 @@ impl Endpoint for FileEndpoint {
                             .class(XSD_STRING)
                             .binding(),
                     )
+                    // Read as a body (ledger #2469): an attached body streams into
+                    // the staging file instead of being collected by the kernel first.
+                    // Part of the contract, so it moved the Sink's contract IRI.
                     .input(
                         ArgSpec::new("content")
                             .summary("UTF-8 text, or standard padded base64 when encoding=base64")
-                            .class(XSD_STRING),
+                            .class(XSD_STRING)
+                            .reads_body(),
                     )
                     .input(sink_encoding_arg())
                     .output("text/plain;charset=utf-8")
@@ -807,12 +813,15 @@ async fn sink(inv: &Invocation<'_>, found: backend::Found, iri: &str) -> Result<
     Ok(written)
 }
 
-/// The `localStorage` backend keeps today's behavior: `content` is inline, decoded
-/// whole, and stored with one `set_item`.
+/// The `localStorage` backend stores with one `set_item`, so `content` is collected
+/// under the run's byte budget and decoded whole: what the kernel did for it before the
+/// Sink declared `content` read as a body (ledger #2469), done here so both backends
+/// keep one contract.
 #[cfg(not(unix))]
 async fn sink(inv: &Invocation<'_>, found: backend::Found, iri: &str) -> Result<u64> {
     let encoding = sink_encoding(inv)?;
-    let content = decode_whole(encoding, inv.inline_arg("content")?)?;
+    let collected = inv.collect(inv.content_body("content").await?).await?;
+    let content = decode_whole(encoding, &collected)?;
     found.write(&content, iri)?;
     Ok(content.len() as u64)
 }
