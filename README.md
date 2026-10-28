@@ -148,6 +148,13 @@ written from one:
   by the kernel under the run's byte budget first. Such a write is therefore not
   bounded by that budget; a producer that refuses part-way (`OverBudget` past
   its own budget, or any other error) leaves nothing behind, as above.
+- **A root's write ceiling** (since 0.2.3, ledger #2493): the root bounds every
+  `Sink` instead. `FileEndpoint::max_write(bytes)` sets it, and a root that sets
+  none gets `DEFAULT_MAX_WRITE`, 64 MiB (the wire's upload bound). It counts the
+  bytes written, after decoding, the same for inline content, a content id and a
+  streamed body. Past it the write is refused with `OverBudget` at the chunk that
+  crosses it (the body is not drained), never truncated, and leaves nothing
+  behind.
 - The `Source` and `Sink` actions state their failure classes (`permanent`, which
   covers `Conflict`; `over-budget`; `unknown`), so conformance's FAILURES check
   compares them.
@@ -272,6 +279,11 @@ One crate, a `cfg`-gated backend.
   reference or content id.
 - `ikigai-core` pin raised to `0.2.3`, the first release with
   `ArgSpec::reads_body`. No other dependency moves.
+- **A per-root write ceiling** (ledger #2493): `FileEndpoint::max_write` and
+  `DEFAULT_MAX_WRITE` (64 MiB), so a streamed write, which the run's byte budget
+  no longer bounds, cannot fill the disk. See "Bodies" above. A write past it is
+  refused with `OverBudget`; a host whose roots took larger writes through the
+  old memory budget raises the ceiling.
 - A file `Source` body states a strong validator, the content id of its bytes,
   hashed once per file version and remembered (ledger #2474); `VALIDATOR_SETTLE`,
   how old a file's last change must be before it states one. See "Bodies" above.
