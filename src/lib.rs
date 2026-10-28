@@ -226,10 +226,15 @@ pub fn cacheable_space(root: impl Into<PathBuf>) -> EndpointSpace {
     )
 }
 
+/// The most bytes one `Sink` may write under a root that sets no ceiling of its own
+/// ([`FileEndpoint::max_write`]): 64 MiB, the wire's upload bound (ledger #2493).
+pub const DEFAULT_MAX_WRITE: u64 = 64 << 20;
+
 /// A file endpoint jailed to a root directory, gated by the capability path-ACL.
 pub struct FileEndpoint {
     root: PathBuf,
     cacheable: bool,
+    max_write: u64,
 }
 
 impl FileEndpoint {
@@ -243,7 +248,20 @@ impl FileEndpoint {
         FileEndpoint {
             root: root.into(),
             cacheable: false,
+            max_write: DEFAULT_MAX_WRITE,
         }
+    }
+
+    /// The most bytes one `Sink` may write under this root ([`DEFAULT_MAX_WRITE`] unless
+    /// set), counted after decoding, whatever the content arrived as (inline, a content
+    /// id, or a body streamed to disk). It is the root's bound because the disk is the
+    /// host's: a streamed body is never collected under the run's byte budget, so without
+    /// it a pipe could fill the disk (ledger #2493). A write past it is refused with
+    /// [`Error::OverBudget`] part-way, never truncated, and leaves nothing behind: the old
+    /// target or none, and no staging file.
+    pub fn max_write(mut self, bytes: u64) -> Self {
+        self.max_write = bytes;
+        self
     }
 
     /// Cache `Source` reads and `Exists` answers under a golden thread (opt-in).
@@ -362,7 +380,7 @@ impl Endpoint for FileEndpoint {
                 Ok(self.source_answer(repr, iri))
             }
             Verb::Sink => {
-                let written = sink(inv, found, iri).await?;
+                let written = sink(inv, found, iri, self.max_write).await?;
                 Ok(ack(format!("wrote {written} bytes to {rel}")))
             }
             Verb::Exists => {
@@ -525,7 +543,7 @@ impl Endpoint for FileEndpoint {
                     .output("text/plain;charset=utf-8")
                     // `permanent`: refused content or path, a `Conflict` from a
                     // streamed content's source. `over-budget`: content past a
-                    // bound. `unknown`: an I/O failure.
+                    // bound, the root's `max_write` among them. `unknown`: an I/O failure.
                     .fails(FailureClass::Permanent)
                     .fails(FailureClass::OverBudget)
                     .fails(FailureClass::Unknown),
@@ -810,14 +828,21 @@ impl Decoder {
 /// reference, or a content id. Content already in memory ([`Body::Bytes`]) is
 /// decoded whole before the disk is touched, as before bodies existed. A stream is
 /// decoded incrementally ([`Decoder`]) into the staging file chunk by chunk and
-/// published only once it ended cleanly: a stream that fails part-way, or content
-/// that does not decode, leaves the target untouched and no staging file behind.
+/// published only once it ended cleanly: a stream that fails part-way, content
+/// that does not decode, or content past `max_write` (checked before each chunk
+/// reaches the disk) leaves the target untouched and no staging file behind.
 #[cfg(unix)]
-async fn sink(inv: &Invocation<'_>, found: backend::Found, iri: &str) -> Result<u64> {
+async fn sink(
+    inv: &Invocation<'_>,
+    found: backend::Found,
+    iri: &str,
+    max_write: u64,
+) -> Result<u64> {
     let encoding = sink_encoding(inv)?;
     let body = inv.content_body("content").await?;
     if let Body::Bytes(bytes) = &body {
         let content = decode_whole(encoding, bytes)?;
+        within_max_write(content.len() as u64, max_write, iri)?;
         found.write(&content, iri)?;
         return Ok(content.len() as u64);
     }
@@ -828,6 +853,7 @@ async fn sink(inv: &Invocation<'_>, found: backend::Found, iri: &str) -> Result<
     while let Some(chunk) = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
         decoder.feed(&chunk?, &mut |decoded| {
             written += decoded.len() as u64;
+            within_max_write(written, max_write, iri)?;
             staged.write_all(decoded, iri)
         })?;
     }
@@ -841,12 +867,32 @@ async fn sink(inv: &Invocation<'_>, found: backend::Found, iri: &str) -> Result<
 /// Sink declared `content` read as a body (ledger #2469), done here so both backends
 /// keep one contract.
 #[cfg(not(unix))]
-async fn sink(inv: &Invocation<'_>, found: backend::Found, iri: &str) -> Result<u64> {
+async fn sink(
+    inv: &Invocation<'_>,
+    found: backend::Found,
+    iri: &str,
+    max_write: u64,
+) -> Result<u64> {
     let encoding = sink_encoding(inv)?;
     let collected = inv.collect(inv.content_body("content").await?).await?;
     let content = decode_whole(encoding, &collected)?;
+    within_max_write(content.len() as u64, max_write, iri)?;
     found.write(&content, iri)?;
     Ok(content.len() as u64)
+}
+
+/// Refuse a write that has reached `written` decoded bytes once that is past the root's
+/// ceiling ([`FileEndpoint::max_write`]).
+fn within_max_write(written: u64, max_write: u64, iri: &str) -> Result<()> {
+    if written > max_write {
+        return Err(Error::OverBudget {
+            detail: format!(
+                "{iri}: the write is past this root's {max_write}-byte ceiling \
+                 (at least {written} bytes)"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Whether a `Source` asks for raw bytes. `as` is declared `one_of
