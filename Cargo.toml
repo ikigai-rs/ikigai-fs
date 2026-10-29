@@ -58,6 +58,8 @@ ikigai-conformance = "0.11.0"
 # test (and like ikigai-web's own spill tests).
 [target.'cfg(unix)'.dev-dependencies]
 ikigai-web = "0.2.2"
+# Exercise JSON queries over file Sources through the real kernel.
+ikigai-json = "0.3.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
