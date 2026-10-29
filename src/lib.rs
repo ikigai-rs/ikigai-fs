@@ -1046,6 +1046,9 @@ fn wants_uri_list(inv: &Invocation<'_>) -> Result<bool> {
 }
 
 /// One URI spelling per disk path, preserving only unreserved bytes and separators.
+// Keep this local: ikigai_core::encode_name preserves non-ASCII IRI characters,
+// while file paths require ASCII-only URIs with uppercase UTF-8 escapes and literal
+// unreserved bytes and `/`. Re-encoding after decoding enforces that one spelling.
 fn encode_file_path(path: &str) -> String {
     let mut out = String::new();
     for byte in path.bytes() {
@@ -1059,6 +1062,9 @@ fn encode_file_path(path: &str) -> String {
     out
 }
 
+// Core's decode_segment is private and decodes individual name segments; this
+// decodes a whole slash-separated path before its canonical spelling and jail
+// checks. Keep strict per-digit hex validation here too (ledger #1096).
 fn decode_file_path(path: &str) -> Result<String> {
     let mut out = Vec::new();
     let mut bytes = path.bytes();
@@ -2521,6 +2527,29 @@ mod tests {
     use futures::executor::block_on;
     use ikigai_core::{Bindings, Iri, Request};
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn file_path_encoding_has_one_ascii_uri_spelling() {
+        for (path, encoded) in [
+            ("AZaz09-._~/", "AZaz09-._~/"),
+            ("café/雪.txt", "caf%C3%A9/%E9%9B%AA.txt"),
+            ("two words/%?#:+", "two%20words/%25%3F%23%3A%2B"),
+        ] {
+            assert_eq!(encode_file_path(path), encoded);
+            assert_eq!(decode_file_path(encoded).unwrap(), path);
+        }
+    }
+
+    #[test]
+    fn file_path_decoder_refuses_non_hex_and_incomplete_escapes() {
+        for path in ["%+1", "%1+", "%-1", "%1-", "%G1", "%1g", "%", "%1"] {
+            assert!(
+                matches!(decode_file_path(path), Err(Error::InvalidArgument { .. })),
+                "{path:?} must be refused"
+            );
+        }
+        assert_eq!(decode_file_path("%4a%4A").unwrap(), "JJ");
+    }
 
     #[cfg(unix)]
     #[test]
