@@ -88,6 +88,7 @@ does the path-aware matching.
   `text/plain` when the bytes are valid UTF-8), or raw bytes with
   `as=application/octet-stream`. **Any other `as` is refused** — the endpoint
   does not convert, so it will not relabel. Uncacheable (a file is a live fact).
+  A `Source` of a **directory** answers its listing (below).
 - `Sink` — write `content`, creating missing directories. The optional `encoding`
   input is one of `utf-8` (the default) and `base64`. Content stays `xsd:string`:
   use UTF-8 text directly, or standard padded base64 for arbitrary bytes. For
@@ -101,6 +102,37 @@ does the path-aware matching.
   requires a writable parent directory. A killed process may leave an unpublished
   staging file. Power-loss durability of the directory entry is not guaranteed.
 - `Exists` / `Delete` — existence check (a read) and removal (a delete).
+
+### Directory listings (ledger #2524)
+
+`source urn:file:searches`, where `searches` is a directory, answers the names of
+its children: sorted, one per line, no trailing newline (`text/plain;charset=utf-8`,
+or bytes under `as=application/octet-stream`). That is the list a map `..` splits on,
+so a folder of files is a set resource:
+
+```
+source urn:file:searches .. ( … )
+```
+
+walks every file in `searches`, and a file added to it is in the next listing with no
+edit to the line. A child names a subdirectory too; its own listing is
+`urn:file:searches/<name>`.
+
+The jail's rules hold for the listing as for a read. The directory is walked like any
+path (no link, its on-disk spelling, `searches/` refused as not canonical) and needs
+`read` on it; a `read` granted only on a child does not grant its directory. A child is
+named only when a `Source` of it could be served: a regular file or a directory (never
+a link, a device, a socket or a FIFO), a UTF-8 name that is one canonical segment (none
+with a Windows meaning, see above), not a `Sink`'s staging file, and one the capability
+grants `read` on, so a deny on `searches/secret.rq` keeps its name out of the listing.
+
+**A listing is never cached, on any mount**, so neither is a line composed over it. A
+`Sink` through the kernel cuts only its own target's thread (an endpoint cannot cut
+another), and a workspace watcher cuts the thread of the path that changed, the new
+file's and not its directory's. A listing cached under the directory's thread would
+therefore leave a new file out until something else cut it. Each listing reads the
+directory afresh instead. `Exists` on a directory answers `true`; `Sink` and `Delete`
+on one are still refused. The browser `localStorage` backend has no directories.
 
 Native file `Source` reads have a **16 MiB (16,777,216 byte)** payload limit
 (`MAX_FILE_SOURCE_BYTES`). The opened file's metadata is checked before reading;

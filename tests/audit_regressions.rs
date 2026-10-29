@@ -463,7 +463,8 @@ fn f4_errors_never_name_the_host_path() {
     let errors: Vec<Error> = [
         source(&k, "nope.txt", &cap).map(|_| ()),
         delete(&k, "dir", &cap),
-        source(&k, "dir", &cap).map(|_| ()),
+        // A directory sources as its listing (ledger #2524); it is still no file to write.
+        sink(&k, "dir", b"x", &cap),
         sink(&k, "plain.txt/under-a-file", b"x", &cap),
     ]
     .into_iter()
