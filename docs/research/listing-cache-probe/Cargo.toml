@@ -1,0 +1,13 @@
+[package]
+name = "listing-cache-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ikigai-fs = { path = "../../.." }
+ikigai-core = "=0.2.7"
+futures = "0.3"
+notify = "=8.2.1"
+
+[workspace]
