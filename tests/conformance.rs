@@ -26,8 +26,8 @@
 
 #![cfg(not(target_family = "wasm"))]
 
-use ikigai_conformance::{Fixture, Report, Suite};
-use ikigai_core::{EndpointSpace, Kernel, Verb};
+use ikigai_conformance::{Check, Fixture, Report, Suite};
+use ikigai_core::{Capability, EndpointSpace, Kernel, MemoryContentStore, Verb};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -72,6 +72,8 @@ fn temp_root() -> PathBuf {
 fn suite() -> Suite {
     VERBS
         .iter()
+        // Source needs the concrete jail path, supplied by `run` below.
+        .filter(|verb| **verb != Verb::Source)
         .fold(Suite::new().required_on_mutating(), |suite, verb| {
             suite.fixture(Fixture::new(ENDPOINT, *verb).binding("path", SEEDED))
         })
@@ -83,8 +85,25 @@ fn suite() -> Suite {
 fn run(suite: Suite, label: &str, mount: impl FnOnce(&PathBuf) -> EndpointSpace) -> Report {
     let root = temp_root();
     let space = Arc::new(mount(&root));
-    let kernel = Kernel::new(space.clone());
-    let report = suite.host_named_space(label, space).run_blocking(&kernel);
+    let store = Arc::new(MemoryContentStore::new(1 << 20));
+    let kernel = Kernel::new(space.clone()).with_content_store(store.clone());
+    // 0.12.0 narrows a root caller to the declaration's wildcard for its
+    // bounded BODIES call. A wildcard passes the kernel gate but is not a
+    // concrete path ACL. Name the seeded file's authority explicitly so both
+    // baseline and bounded calls retain the same usable read grant.
+    let suite = suite.fixture(
+        Fixture::new(ENDPOINT, Verb::Source)
+            .binding("path", SEEDED)
+            .capability(Capability::scoped([format!(
+                "urn:cap:fs:read:{}",
+                root.join(SEEDED).display()
+            )])),
+    );
+    let report = suite
+        .body_space(space.clone())
+        .body_input_store(store)
+        .host_named_space(label, space)
+        .run_blocking(&kernel);
     std::fs::remove_dir_all(&root).ok();
     report
 }
@@ -92,7 +111,30 @@ fn run(suite: Suite, label: &str, mount: impl FnOnce(&PathBuf) -> EndpointSpace)
 /// The walk saw exactly the one endpoint and its four actions. A fifth verb
 /// added to `describe()` without a line here changes the count; a declared
 /// verb that binds nothing is a stale list.
-fn assert_shape(report: &Report) {
+fn assert_shape(report: &Report, cacheable: bool) {
+    // Delete has no content pipeline and is never fired by OUTPUTS. The live
+    // mount also cannot establish agreement across independent Source calls.
+    // Every other probe must run, including all deterministic body checks.
+    assert_eq!(
+        report.unprobed.len(),
+        if cacheable { 1 } else { 2 },
+        "{report}"
+    );
+    for probe in report.unprobed.iter() {
+        assert!(
+            probe.endpoint == ENDPOINT
+                && ((probe.verb == Verb::Delete
+                    && probe.check == Check::Outputs
+                    && probe.reason.starts_with("never fired under root:"))
+                    || (!cacheable
+                        && probe.verb == Verb::Source
+                        && probe.check == Check::Bodies
+                        && probe
+                            .reason
+                            .starts_with("uncacheable, time-varying, or volatile answer:"))),
+            "unexpected unprobed check: {probe:?}\n{report}"
+        );
+    }
     assert_eq!(report.endpoints, 1, "one `file` endpoint: {report}");
     assert_eq!(
         report.actions,
@@ -109,7 +151,7 @@ fn conforms() {
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
-    assert_shape(&report);
+    assert_shape(&report, false);
 }
 
 #[test]
@@ -122,5 +164,5 @@ fn cacheable_mount_conforms() {
     // Printed even when clean (`--nocapture`): the report is the record.
     eprintln!("{report}");
     assert!(report.is_clean(), "{report}");
-    assert_shape(&report);
+    assert_shape(&report, true);
 }

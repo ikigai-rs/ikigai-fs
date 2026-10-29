@@ -51,9 +51,9 @@ futures = "0.3"
 # The disk fixture and its RDF/random dependencies are native-only.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`): walks every bound
-# endpoint and reports every violation at once. 0.11 enables DATATYPES and
-# FAILURES by default and links the core 0.2.0 streams release.
-ikigai-conformance = "0.11.0"
+# endpoint and reports every violation at once. 0.12 enables BODIES and
+# BODY-INPUTS by default.
+ikigai-conformance = "0.12.0"
 
 # The web door a file body is served through in `tests/validator.rs` (ledger #2474):
 # its `206`/`304` over a `Replay` that states a strong validator. Unix only, like the
