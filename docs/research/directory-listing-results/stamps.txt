@@ -1,0 +1,5 @@
+PASS in-place content write leaves directory stamp unchanged (correct for names)
+PASS tuple collision: names changed a -> b, (dev,ino,mtime_ns,size) identical
+{"before": [64513, 24915629, 1793271025543114194, 4096], "after": [64513, 24915629, 1793271025543114194, 4096]}
+{"rename_trials": 10000, "natural_nanosecond_collisions": 0, "collisions_if_seconds_only": 10000}
+directory fadvise accepted; does NOT prove dentries/inodes/block cache evicted

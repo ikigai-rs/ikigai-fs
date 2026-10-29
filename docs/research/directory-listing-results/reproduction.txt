@@ -1,0 +1,4 @@
+PASS current: external create visible; unchanged listing is NOT cached
+PASS unsafe spike reproduces stale set after child-only cut
+PASS parent cut repairs it after delivery; says nothing about delivery latency
+PASS unsafe spike also stays stale after a real kernel Sink creates a child

@@ -1,0 +1,2 @@
+stat: unchanged reads=2 scans=1 produced=1 composite_runs=2
+hash: unchanged reads=2 scans=2 produced=1 composite_runs=2
