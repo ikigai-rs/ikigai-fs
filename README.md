@@ -263,7 +263,20 @@ One crate, a `cfg`-gated backend.
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
 
-## 0.2.3 (unreleased)
+## 0.2.4 (unreleased)
+
+- File Sources now use `mime_guess`'s extension table, with explicit ikigai and
+  RDF overrides. GeoJSON is `application/geo+json`, so `urn:json:query` can read
+  `.geojson` files directly. XML, RSS, OPML, RDF/XML, XSL, SPARQL queries, SVG,
+  CSV and other recognized extensions now carry specific media types.
+  Callers that matched `application/octet-stream` or `text/plain` for these
+  extensions now see the specific type. Unknown-extension and extensionless
+  files keep their existing UTF-8/binary fallback and charset behavior.
+- Add `mime_guess` 2 as a runtime dependency (without reverse mappings), and
+  `ikigai-json` 0.3.1 as a Unix-only test dependency for the kernel query regression.
+  Patch release prepared; not published.
+
+## 0.2.3
 
 - **The `Sink` action declares `content` read as a body** (ledger #2469, after
   core's #2402): an attached body streams to disk instead of the kernel

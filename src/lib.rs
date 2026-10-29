@@ -1172,20 +1172,23 @@ fn deny(detail: &str) -> Error {
 }
 
 fn media_type_for(path: &Path) -> ReprType {
-    let media = match path.extension().and_then(|e| e.to_str()) {
-        Some("txt") => "text/plain",
-        Some("md") => "text/markdown",
-        Some("ttl") => "text/turtle",
-        Some("nt") => "application/n-triples",
-        Some("json") => "application/json",
-        Some("jsonld") => "application/ld+json",
-        Some("html") => "text/html",
-        // A declared arrangement written as an s-expression (ikigai-sexpr's arrangement surface).
-        // Deliberately NOT `text/x-sexpr`: ikigai-sexpr already has a lossless `text/x-sexpr →
-        // text/turtle` transreptor (the code-graph profile), so a lossless-only selector over that
-        // type would hand the arrangement builder a list graph instead of an arrangement.
-        Some("arrangement") => "text/x-ikigai-arrangement",
-        _ => OCTET_STREAM,
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let media = match extension.to_ascii_lowercase().as_str() {
+        // Keep the ikigai arrangement surface distinct from the sexpr code-graph type.
+        "arrangement" => "text/x-ikigai-arrangement",
+        // RFC 7946's GeoJSON type lets JSON consumers recognize the +json suffix.
+        "geojson" => "application/geo+json",
+        // SPARQL query inputs need the registered query type, not generic text.
+        "rq" => "application/sparql-query",
+        // JSON-LD transreptors key on this registered type.
+        "jsonld" => "application/ld+json",
+        // Turtle transreptors key on this type, regardless of the upstream table.
+        "ttl" => "text/turtle",
+        // N-Triples transreptors key on this type, regardless of the upstream table.
+        "nt" => "application/n-triples",
+        _ => mime_guess::from_ext(extension)
+            .first_raw()
+            .unwrap_or(OCTET_STREAM),
     };
     ReprType::new(media)
 }

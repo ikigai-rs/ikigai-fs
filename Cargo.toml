@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-fs"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Capability-gated file/store ikigai module: jailed to a root with a default-deny path-ACL; SOURCE/SINK/EXISTS/DELETE. A cfg-gated backend links into native (std::fs) and wasm32 (browser localStorage) hosts from one crate."
@@ -24,6 +24,8 @@ ikigai-core = "0.2.3"
 async-trait = "0.1"
 # Same vetted RFC 4648 implementation/profile as ikigai-http::base64.
 base64 = "0.22"
+# Vetted extension table shared with hosts; pure data, including on wasm32.
+mime_guess = { version = "2", default-features = false }
 
 # Native backend: the jail resolves every name with `openat` relative to a handle on
 # its parent (`O_NOFOLLOW`, `O_DIRECTORY`), reads the directory to learn a name's
