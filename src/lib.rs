@@ -85,7 +85,11 @@
 //! `Source` hands back a **string by default** (a known text media type from the
 //! extension, or `text/plain` when the bytes decode as UTF-8); pass `as` =
 //! `application/octet-stream` to get the raw **bytes** instead. Any other `as` is
-//! refused: this endpoint does not convert, so it will not relabel. `Sink` writes
+//! refused: this endpoint does not convert, so it will not relabel. A `Source` of a
+//! **directory** answers its listing: the names of its children a `Source` could serve
+//! (regular files and directories, no links, canonical names, `read` granted), sorted,
+//! one per line, the list a map `..` walks (ledger #2524). A listing is never cached,
+//! on any mount: a file added cuts only its own thread, never its directory's. `Sink` writes
 //! UTF-8 `content` by default, or decodes it to bytes with `encoding=base64`.
 //! On Unix, Sink syncs a same-directory staging file before atomic publication,
 //! so readers see complete old or new content and a failed staging write leaves
@@ -289,8 +293,11 @@ impl FileEndpoint {
 struct Admitted<'a> {
     rel: &'a str,
     iri: &'a str,
-    leaf: &'a str,
+    /// The path's names, canonical; the last is the leaf.
+    names: Vec<&'a str>,
     raw: bool,
+    /// The capability's rules for the verb's action, as judged the path.
+    acl: Acl,
     found: backend::Found,
 }
 
@@ -326,7 +333,8 @@ impl FileEndpoint {
         // refusal says nothing about what is or is not there; and because the walk
         // refuses any path whose opened file is not exactly these names (a link, a
         // folded spelling), the path judged here is the path opened.
-        if !cap_allows(inv.capability, action, &self.root, &jail, &names) {
+        let acl = Acl::new(inv.capability, action, &self.root, &jail);
+        if !acl.allows(&names) {
             // Typed `Denied` — a permanent authority failure the trace, manifold,
             // and wire recognize as a 403-equivalent without sniffing message text.
             return Err(Error::Denied(format!(
@@ -339,10 +347,59 @@ impl FileEndpoint {
         Ok(Admitted {
             rel,
             iri,
-            leaf: names.last().copied().unwrap_or_default(),
+            names,
             raw,
+            acl,
             found,
         })
+    }
+
+    /// A directory's `Source`: the names of its children, sorted, one per line with no
+    /// trailing newline (the convention a map `..` splits on), as text, or as raw bytes
+    /// under `as=application/octet-stream` (ledger #2524).
+    ///
+    /// The jail's rules hold for the listing as for a read. The directory itself was
+    /// walked and judged like any path (no link, its on-disk spelling, `read` granted on
+    /// it). A child is named only if a `Source` of it could be served: a regular file
+    /// or a directory, never a link or a device; a name in UTF-8 that is one canonical
+    /// segment ([`windows_meaning`]); not a `Sink`'s staging file; and one the
+    /// capability grants `read` on, so a deny on a child keeps its name out too.
+    ///
+    /// **Never cached, on any mount.** No cut reaches it when a child is added: a
+    /// `Sink` through the kernel cuts only its own target's thread (no endpoint can cut
+    /// another), and a workspace watcher cuts the thread of the path that changed, which
+    /// is the new file's, not its directory's. A listing cached under the directory's
+    /// thread would leave a new file out until something else cut it, so every listing
+    /// reads the directory afresh, and so does whatever is composed over it.
+    fn listing(&self, admitted: Admitted<'_>) -> Result<Representation> {
+        let Admitted {
+            iri,
+            names,
+            raw,
+            acl,
+            found,
+            ..
+        } = admitted;
+        let mut listed = Vec::new();
+        for child in found.children(iri)? {
+            if windows_meaning(&child).is_some() || is_staging_name(&child) {
+                continue;
+            }
+            let path: Vec<&str> = names.iter().copied().chain([child.as_str()]).collect();
+            if acl.allows(&path) {
+                listed.push(child);
+            }
+        }
+        listed.sort();
+        let repr_type = if raw {
+            ReprType::new(OCTET_STREAM)
+        } else {
+            ReprType::new("text/plain").with_param("charset", "utf-8")
+        };
+        Ok(Representation::new(
+            repr_type,
+            listed.join("\n").into_bytes(),
+        ))
     }
 
     /// A read's answer, cached under the file's golden thread when the mount
@@ -366,13 +423,19 @@ impl FileEndpoint {
 #[async_trait]
 impl Endpoint for FileEndpoint {
     async fn invoke(&self, inv: &Invocation<'_>) -> Result<Representation> {
+        let admitted = self.admit(inv)?;
+        if inv.request.verb == Verb::Source && admitted.found.is_dir() {
+            return self.listing(admitted);
+        }
         let Admitted {
             rel,
             iri,
-            leaf,
+            names,
             raw,
             found,
-        } = self.admit(inv)?;
+            ..
+        } = admitted;
+        let leaf = names.last().copied().unwrap_or_default();
         match inv.request.verb {
             Verb::Source => {
                 let bytes = found.read(iri)?;
@@ -416,13 +479,18 @@ impl Endpoint for FileEndpoint {
     async fn invoke_body(&self, inv: &Invocation<'_>) -> Result<Representation<Body>> {
         #[cfg(unix)]
         if inv.request.verb == Verb::Source {
+            let admitted = self.admit(inv)?;
+            if admitted.found.is_dir() {
+                return self.listing(admitted).map(Representation::into_body);
+            }
             let Admitted {
                 iri,
-                leaf,
+                names,
                 raw,
                 found,
                 ..
-            } = self.admit(inv)?;
+            } = admitted;
+            let leaf = names.last().copied().unwrap_or_default();
             let (repr_type, body) = found.body(leaf, raw, iri)?;
             return Ok(self.source_answer(Representation::from_body(repr_type, body), iri));
         }
@@ -443,7 +511,9 @@ impl Endpoint for FileEndpoint {
                  one are refused) and the capability path-ACL \
                  (`urn:cap:fs:<read|write|delete>:<path>`, deepest rule wins, `-`-prefixed \
                  exclusions win ties, default-deny). `Source` yields a string by default; \
-                 `as=application/octet-stream` yields raw bytes; a missing file is NotFound.",
+                 `as=application/octet-stream` yields raw bytes; a missing file is NotFound. \
+                 A `Source` of a directory yields its listing: the child names it may \
+                 serve, sorted, one per line (never cached).",
             )
             .verb(Verb::Source)
             .verb(Verb::Sink)
@@ -683,6 +753,15 @@ fn is_windows_device_name(name: &str) -> bool {
 }
 
 /// Kept identical in the aggregate description and the Sink action contract.
+/// Whether `name` is the name a `Sink` stages under (`.ikigai-fs-<32 hex>.tmp`): a
+/// write in flight, or one a killed process left unpublished, never a file of the set a
+/// directory lists.
+fn is_staging_name(name: &str) -> bool {
+    name.strip_prefix(".ikigai-fs-")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 fn sink_encoding_arg() -> ArgSpec {
     ArgSpec::new("encoding")
         .summary("Sink only: encoding of content; defaults to utf-8.")
@@ -918,60 +997,73 @@ fn wants_raw_bytes(inv: &Invocation<'_>) -> Result<bool> {
     })
 }
 
-/// Whether `capability` grants `action` on the file at `names` (root-relative), by
-/// the path-ACL.
+/// The path-ACL for one request: `capability`'s `urn:cap:fs:<action>:` scopes, each
+/// mapped into the jail once ([`Rule::map`]), so a listing judges every child it names
+/// without mapping them again.
 ///
-/// `root` allows everything (the jail is the only remaining bound). Otherwise each
-/// `urn:cap:fs:<action>:<path>` scope is mapped into the jail ([`Rule::map`]) and the
+/// `root` allows everything (the jail is the only remaining bound). Otherwise the
 /// deepest rule that contains the target decides, with deny winning ties, and no
 /// match meaning deny.
-fn cap_allows(
-    capability: &Capability,
-    action: &str,
-    root: &Path,
-    jail: &backend::Jail,
-    names: &[&str],
-) -> bool {
-    if capability.is_root() {
-        return true;
-    }
-    let Some(scopes) = capability.scopes() else {
-        return false;
-    };
-    let prefix = format!("urn:cap:fs:{action}:");
-    let roots = Roots::of(root, jail);
+struct Acl {
+    root: bool,
+    rules: Vec<(Rule, bool)>,
+}
 
-    let mut best: Option<i64> = None;
-    let mut allowed = false;
-    for scope in scopes {
-        let Some(rest) = scope.strip_prefix(&prefix) else {
-            continue;
-        };
-        // A leading `-` marks a deny rule; the remainder is the directory/file.
-        let (rule_allows, dir) = match rest.strip_prefix('-') {
-            Some(d) => (false, d),
-            None => (true, rest),
-        };
-        let Some(rule) = Rule::map(dir, rule_allows, &roots, jail) else {
-            continue;
-        };
-        if !rule.contains(names) {
-            continue;
+impl Acl {
+    fn new(capability: &Capability, action: &str, root: &Path, jail: &backend::Jail) -> Acl {
+        if capability.is_root() {
+            return Acl {
+                root: true,
+                rules: Vec::new(),
+            };
         }
-        let depth = rule.depth();
-        match best {
-            Some(b) if depth < b => {} // a more specific rule already decided
-            Some(b) if depth == b => {
-                // Tie on specificity: deny wins.
-                allowed = allowed && rule_allows;
-            }
-            _ => {
-                best = Some(depth);
-                allowed = rule_allows;
+        let mut rules = Vec::new();
+        if let Some(scopes) = capability.scopes() {
+            let prefix = format!("urn:cap:fs:{action}:");
+            let roots = Roots::of(root, jail);
+            for scope in scopes {
+                let Some(rest) = scope.strip_prefix(&prefix) else {
+                    continue;
+                };
+                // A leading `-` marks a deny rule; the remainder is the directory/file.
+                let (rule_allows, dir) = match rest.strip_prefix('-') {
+                    Some(d) => (false, d),
+                    None => (true, rest),
+                };
+                if let Some(rule) = Rule::map(dir, rule_allows, &roots, jail) {
+                    rules.push((rule, rule_allows));
+                }
             }
         }
+        Acl { root: false, rules }
     }
-    best.is_some() && allowed
+
+    /// Whether the ACL grants its action on the file at `names` (root-relative).
+    fn allows(&self, names: &[&str]) -> bool {
+        if self.root {
+            return true;
+        }
+        let mut best: Option<i64> = None;
+        let mut allowed = false;
+        for (rule, rule_allows) in &self.rules {
+            if !rule.contains(names) {
+                continue;
+            }
+            let depth = rule.depth();
+            match best {
+                Some(b) if depth < b => {} // a more specific rule already decided
+                Some(b) if depth == b => {
+                    // Tie on specificity: deny wins.
+                    allowed = allowed && *rule_allows;
+                }
+                _ => {
+                    best = Some(depth);
+                    allowed = *rule_allows;
+                }
+            }
+        }
+        best.is_some() && allowed
+    }
 }
 
 /// The jail root's spellings a scope may be written against: as mounted, and
@@ -1341,6 +1433,58 @@ mod backend {
 
         pub(super) fn exists(&self) -> bool {
             self.leaf.is_some()
+        }
+
+        /// Whether the walk reached a directory at the leaf.
+        pub(super) fn is_dir(&self) -> bool {
+            self.leaf
+                .as_ref()
+                .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Directory)
+        }
+
+        /// The names in the directory the walk judged that a `Source` could open: each
+        /// a regular file or a directory, in UTF-8. A link, a device, a socket or a
+        /// FIFO is left out, as is a name that is not UTF-8 (no `urn:file:` IRI spells
+        /// it). The directory is opened through the walk's parent handle without
+        /// following a link, and must still be the one judged.
+        pub(super) fn children(self, iri: &str) -> Result<Vec<String>> {
+            let Some(stat) = self.leaf.as_ref() else {
+                return Err(not_found(iri));
+            };
+            let dir = open_dir(&self.dir, OsStr::new(self.leaf_name())).map_err(|e| match e {
+                Errno::LOOP | Errno::MLINK | Errno::NOTDIR => changed(iri),
+                e => io_error("list", iri, e),
+            })?;
+            let now = rfs::fstat(&dir).map_err(|e| io_error("list", iri, e))?;
+            if now.st_ino != stat.st_ino || now.st_dev != stat.st_dev {
+                return Err(changed(iri));
+            }
+            let mut names = Vec::new();
+            for entry in rfs::Dir::read_from(dir.as_fd()).map_err(|e| io_error("list", iri, e))? {
+                let entry = entry.map_err(|e| io_error("list", iri, e))?;
+                let raw = entry.file_name().to_bytes();
+                if raw == b"." || raw == b".." {
+                    continue;
+                }
+                let Ok(name) = std::str::from_utf8(raw) else {
+                    continue;
+                };
+                // The entry's type, from the listing where the file system reports it,
+                // else from the entry itself, never following a link.
+                let file_type = match entry.file_type() {
+                    FileType::Unknown => match rfs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+                        Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                        // Removed since it was listed.
+                        Err(Errno::NOENT) => continue,
+                        Err(e) => return Err(io_error("list", iri, e)),
+                    },
+                    known => known,
+                };
+                if matches!(file_type, FileType::RegularFile | FileType::Directory) {
+                    names.push(name.to_string());
+                }
+            }
+            Ok(names)
         }
 
         pub(super) fn read(self, iri: &str) -> Result<Vec<u8>> {
@@ -2183,6 +2327,15 @@ mod backend {
             self.present
         }
 
+        /// `localStorage` keys a file by its whole path: there are no directories.
+        pub(super) fn is_dir(&self) -> bool {
+            false
+        }
+
+        pub(super) fn children(self, iri: &str) -> Result<Vec<String>> {
+            Err(Error::NotFound(format!("`{iri}` is not a directory")))
+        }
+
         pub(super) fn read(self, iri: &str) -> Result<Vec<u8>> {
             let store = storage(iri)?;
             if let Some(encoded) = store
@@ -2259,6 +2412,12 @@ mod backend {
     impl Found {
         pub(super) fn exists(&self) -> bool {
             match *self {}
+        }
+        pub(super) fn is_dir(&self) -> bool {
+            match *self {}
+        }
+        pub(super) fn children(self, _iri: &str) -> Result<Vec<String>> {
+            match self {}
         }
         pub(super) fn read(self, _iri: &str) -> Result<Vec<u8>> {
             match self {}
@@ -2975,15 +3134,14 @@ mod tests {
         std::fs::write(root.join("file.txt"), b"x").unwrap();
         let ep = FileEndpoint::new(&root);
         let all = Capability::root();
-        // A directory is not a file, for any verb that needs one.
-        for verb in [Verb::Source, Verb::Delete] {
-            let err = invoke(&ep, verb, "dir", &all, &[]).unwrap_err();
-            assert!(
-                matches!(err, Error::InvalidArgument { .. }),
-                "{verb:?}: {err:?}"
-            );
-        }
+        // A directory is not a file to delete; its `Source` is its listing (ledger #2524).
+        let err = invoke(&ep, Verb::Delete, "dir", &all, &[]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
         assert!(root.join("dir").is_dir());
+        assert_eq!(
+            invoke(&ep, Verb::Source, "dir", &all, &[]).unwrap().bytes,
+            b""
+        );
         // A file named as a directory: absent to a read, refused to a write.
         let exists = invoke(&ep, Verb::Exists, "file.txt/x", &all, &[]).unwrap();
         assert_eq!(exists.bytes, b"false");
