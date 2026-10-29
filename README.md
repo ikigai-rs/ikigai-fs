@@ -105,18 +105,31 @@ does the path-aware matching.
 
 ### Directory listings (ledger #2524)
 
-`source urn:file:searches`, where `searches` is a directory, answers the names of
-its children: sorted, one per line, no trailing newline (`text/plain;charset=utf-8`,
-or bytes under `as=application/octet-stream`). That is the list a map `..` splits on,
-so a folder of files is a set resource:
+`source urn:file:searches`, where `searches` is a directory, still answers bare
+child names: sorted, one per line, no trailing newline (`text/plain;charset=utf-8`,
+or the same bytes under `as=application/octet-stream`).
+
+Use `as=text/uri-list` to get full child URIs, one per line, for a map that sources
+each member. For example, with saved SPARQL queries in `searches`:
 
 ```
-source urn:file:searches .. ( … )
+source urn:file:searches as=text/uri-list .. ( urn:iki:fn:compose | urn:sparql:select graph=urn:example:graph )
 ```
 
-walks every file in `searches`, and a file added to it is in the next listing with no
-edit to the line. A child names a subdirectory too; its own listing is
-`urn:file:searches/<name>`.
+`compose` sources each URI as query text, which the next stage runs. A listing of
+`caching.rq` and `rss.rq` becomes `urn:file:searches/caching.rq` and
+`urn:file:searches/rss.rq`. The face uses newline separators with no trailing
+newline, so a map has no empty final member. A child directory is included too;
+source its URI to list its members. Empty directories answer an empty list.
+`text/uri-list` is accepted only for directories; files refuse it rather than
+relabel their content. Both the face and its `as` choice are declared on Source.
+
+File URI paths use UTF-8 percent-encoding with uppercase hex: only ASCII
+letters, digits, `-._~` and the `/` separators stay literal. For example,
+`saved searches/café.rq` is `urn:file:saved%20searches/caf%C3%A9.rq`.
+`%`, `#`, `?` and newlines in names are escaped too. Decoding happens before
+the jail and path-ACL checks; alternate encodings (including escaped `/` or
+unreserved bytes) are refused, preserving one URI per file and its cache thread.
 
 The jail's rules hold for the listing as for a read. The directory is walked like any
 path (no link, its on-disk spelling, `searches/` refused as not canonical) and needs
@@ -209,7 +222,7 @@ selectable from the action manifold and projects as one well-typed MCP tool.
 The browser backend stores new writes as base64 under `ikigai:fs-bytes:<root>/<path>`
 in localStorage, and falls back to existing `ikigai:fs:<root>/<path>` text entries.
 New writes take precedence; deletion removes both entries. Older module versions
-cannot read the new namespace. Source's inputs and representation rules are unchanged.
+cannot read the new namespace.
 
 ## Mounting
 
@@ -294,6 +307,23 @@ One crate, a `cfg`-gated backend.
   meaning on Windows is refused before that, as a path, on every platform, so a
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
+
+## 0.3.0 (unreleased)
+
+- Add the opt-in directory `text/uri-list` face (ledger #2608), declared in the
+  endpoint and Source action descriptions. Default bare names, raw listings,
+  filtering and listing caching policy are unchanged. Chosen over `names=iri`
+  because `as` already selects representations, and over changing the default
+  because existing callers and listing tests depend on bare names.
+- File URI paths now decode canonical UTF-8 percent escapes. **Minor version**:
+  special-character paths must use the canonical URI spelling above, on every
+  verb. Previously escapes were literal disk-name characters, so a file named
+  `a%20b` now needs `urn:file:a%2520b`; a raw Unicode spelling such as
+  `urn:file:café.rq` now needs `urn:file:caf%C3%A9.rq`. This avoids aliases that
+  would invalidate file cache identity. Ordinary paths are unchanged.
+- Engine/map and SPARQL regression coverage runs two saved queries through the
+  actual pipeline. New dependencies are Unix-only test dependencies. Prepared
+  only; do not publish.
 
 ## 0.2.4 (unreleased)
 

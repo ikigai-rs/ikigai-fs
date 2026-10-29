@@ -49,7 +49,19 @@ fn source(
     rel: &str,
     cap: &Capability,
 ) -> Result<(ReprType, String), Error> {
-    let request = Request::new(Verb::Source, Iri::parse(format!("urn:file:{rel}")).unwrap());
+    source_face(endpoint, rel, cap, None)
+}
+
+fn source_face(
+    endpoint: &FileEndpoint,
+    rel: &str,
+    cap: &Capability,
+    face: Option<&str>,
+) -> Result<(ReprType, String), Error> {
+    let mut request = Request::new(Verb::Source, Iri::parse(format!("urn:file:{rel}")).unwrap());
+    if let Some(face) = face {
+        request = request.with_arg("as", ArgRef::Inline(face.as_bytes().to_vec()));
+    }
     let mut bindings = Bindings::new();
     bindings.insert("path", rel);
     let inv = Invocation::detached(&request, &bindings, cap);
@@ -91,7 +103,14 @@ fn a_directory_sources_as_the_newline_list_of_its_child_names() {
 fn an_empty_directory_lists_nothing() {
     let root = Root::new("empty");
     std::fs::create_dir(root.0.join("searches")).unwrap();
-    assert_eq!(listing(&FileEndpoint::new(&root.0), "searches"), "");
+    let ep = FileEndpoint::new(&root.0);
+    assert_eq!(listing(&ep, "searches"), "");
+    assert_eq!(
+        source_face(&ep, "searches", &Capability::root(), Some("text/uri-list"))
+            .unwrap()
+            .1,
+        ""
+    );
 }
 
 #[test]
@@ -138,6 +157,17 @@ fn links_and_names_the_jail_refuses_are_not_listed() {
     )
     .unwrap();
     assert_eq!(listing(&FileEndpoint::new(&root.0), "searches"), "kept.rq");
+    assert_eq!(
+        source_face(
+            &FileEndpoint::new(&root.0),
+            "searches",
+            &Capability::root(),
+            Some("text/uri-list")
+        )
+        .unwrap()
+        .1,
+        "urn:file:searches/kept.rq"
+    );
 }
 
 #[test]
@@ -218,4 +248,232 @@ fn a_directory_still_is_not_a_file_to_delete_or_sink() {
         );
     }
     assert!(Path::new(&root.0.join("searches/a.rq")).is_file());
+}
+
+fn saved_search_engine(root: &Root) -> ikigai_engine::Engine {
+    let space = ikigai_sparql::space()
+        .bind(
+            ikigai_core::Exact::new("urn:iki:fn:compose"),
+            ikigai_fn::compose(),
+        )
+        .bind(
+            ikigai_core::UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).unwrap(),
+            FileEndpoint::new(&root.0),
+        );
+    ikigai_engine::Engine::new(Arc::new(Kernel::with_meta_renderer(
+        Arc::new(space),
+        Arc::new(JsonRenderer),
+    )))
+}
+
+fn output(engine: &ikigai_engine::Engine, line: &str) -> Result<String, String> {
+    match engine.eval(line) {
+        ikigai_engine::Action::Output(entry) => entry.result,
+        _ => panic!("expected output"),
+    }
+}
+
+#[test]
+fn a_uri_listing_map_runs_both_saved_searches() {
+    let root = Root::new("saved-searches");
+    root.write("searches/caching.rq", b"SELECT (1 AS ?answer) WHERE {}");
+    root.write("searches/rss.rq", b"SELECT (2 AS ?answer) WHERE {}");
+    let engine = saved_search_engine(&root);
+    let bare = output(
+        &engine,
+        "source urn:file:searches .. ( urn:iki:fn:compose | urn:sparql:select as=text/csv )",
+    )
+    .unwrap_err();
+    assert!(bare.contains("not an IRI"), "{bare}");
+    let answer = output(
+        &engine,
+        "source urn:file:searches as=text/uri-list .. ( urn:iki:fn:compose | urn:sparql:select as=text/csv )",
+    ).unwrap();
+    assert_eq!(answer.replace("\r\n", "\n"), "answer\n1\n\nanswer\n2\n");
+    assert_eq!(engine.last_fan_out().unwrap().nominal, 2);
+}
+
+struct JsonRenderer;
+impl ikigai_core::MetaRenderer for JsonRenderer {
+    fn render(
+        &self,
+        description: &ikigai_core::Description,
+        _: &ReprType,
+    ) -> ikigai_core::Result<ikigai_core::Representation> {
+        Ok(ikigai_core::Representation::new(
+            ReprType::new("application/json"),
+            serde_json::to_vec(description).unwrap(),
+        ))
+    }
+}
+
+#[test]
+fn uri_members_encode_each_utf8_path_and_round_trip_through_the_kernel() {
+    let root = Root::new("escaped");
+    for name in [
+        "two words.rq",
+        "café.rq",
+        "100%.rq",
+        "hash#query?.rq",
+        "line\nbreak.rq",
+    ] {
+        root.write(&format!("saved searches/{name}"), name.as_bytes());
+    }
+    root.write("saved searches/nested/file.rq", b"nested");
+    let ep = FileEndpoint::new(&root.0);
+    let (repr, text) = source_face(
+        &ep,
+        "saved%20searches",
+        &Capability::root(),
+        Some("text/uri-list"),
+    )
+    .unwrap();
+    assert_eq!(repr, ReprType::new("text/uri-list"));
+    assert_eq!(
+        text,
+        [
+            "urn:file:saved%20searches/100%25.rq",
+            "urn:file:saved%20searches/caf%C3%A9.rq",
+            "urn:file:saved%20searches/hash%23query%3F.rq",
+            "urn:file:saved%20searches/line%0Abreak.rq",
+            "urn:file:saved%20searches/nested",
+            "urn:file:saved%20searches/two%20words.rq",
+        ]
+        .join("\n")
+    );
+    let kernel = Kernel::new(Arc::new(ikigai_fs::space(&root.0)));
+    for uri in text.lines() {
+        let answer = block_on(kernel.issue(
+            Request::new(Verb::Source, Iri::parse(uri).unwrap()),
+            &Capability::root(),
+        ))
+        .unwrap();
+        assert!(!answer.bytes.is_empty(), "{uri}");
+    }
+    assert_eq!(
+        listing(&ep, "saved%20searches"),
+        "100%.rq\ncafé.rq\nhash#query?.rq\nline\nbreak.rq\nnested\ntwo words.rq"
+    );
+    assert_eq!(
+        source_face(
+            &ep,
+            "saved%20searches",
+            &Capability::root(),
+            Some("application/octet-stream")
+        )
+        .unwrap()
+        .1,
+        listing(&ep, "saved%20searches")
+    );
+}
+
+#[test]
+fn uri_face_is_directory_only_and_declared_on_the_source_contract() {
+    let root = Root::new("uri-contract");
+    root.write("file.rq", b"SELECT 1");
+    let ep = FileEndpoint::new(&root.0);
+    assert!(
+        matches!(source_face(&ep, "file.rq", &Capability::root(), Some("text/uri-list")), Err(Error::InvalidArgument { name, .. }) if name == "as")
+    );
+    let description = ep.describe();
+    description.validate().unwrap();
+    let action = description
+        .action_specs()
+        .into_iter()
+        .find(|a| a.verb == Verb::Source)
+        .unwrap();
+    let as_arg = action.inputs.iter().find(|a| a.name == "as").unwrap();
+    assert!(as_arg.one_of.contains(&"text/uri-list".to_string()));
+    assert!(action.outputs.iter().any(|o| o == "text/uri-list"));
+}
+
+#[test]
+fn encoded_paths_cannot_bypass_canonical_spelling_or_the_acl() {
+    let root = Root::new("encoded-jail");
+    root.write("searches/two words.rq", b"private");
+    let ep = FileEndpoint::new(&root.0);
+    let cap = Capability::scoped([
+        format!("urn:cap:fs:read:{}", root.0.display()),
+        format!(
+            "urn:cap:fs:read:-{}/searches/two words.rq",
+            root.0.display()
+        ),
+    ]);
+    assert_eq!(
+        source_face(&ep, "searches", &cap, Some("text/uri-list"))
+            .unwrap()
+            .1,
+        ""
+    );
+    assert!(matches!(
+        source(&ep, "searches/two%20words.rq", &cap),
+        Err(Error::Denied(_))
+    ));
+    for path in [
+        "searches%2Ftwo%20words.rq",
+        "searches/%2E%2E/secret",
+        "searches/two%20words%2erq",
+        "searches/%FF",
+        "searches/%00",
+    ] {
+        assert!(
+            matches!(
+                source(&ep, path, &Capability::root()),
+                Err(Error::InvalidArgument { .. })
+            ),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn uri_listings_stay_live_and_encoded_file_writes_cut_their_cache_thread() {
+    let root = Root::new("uri-cache");
+    root.write("searches/two words.rq", b"old");
+    let kernel = Kernel::new(Arc::new(ikigai_fs::cacheable_space(&root.0)));
+    let cap = Capability::root();
+    let read = |uri: &str, face: Option<&str>| {
+        let mut request = Request::new(Verb::Source, Iri::parse(uri).unwrap());
+        if let Some(face) = face {
+            request = request.with_arg("as", ArgRef::Inline(face.as_bytes().to_vec()));
+        }
+        block_on(kernel.issue(request, &cap)).unwrap().bytes
+    };
+    let uri = "urn:file:searches/two%20words.rq";
+    assert_eq!(read(uri, None), b"old");
+    root.write("searches/two words.rq", b"external");
+    assert!(
+        matches!(
+            block_on(kernel.issue(Request::new(Verb::Source, Iri::parse(uri).unwrap()), &cap)),
+            Err(Error::Conflict(_))
+        ),
+        "cached bodies still refuse external changes"
+    );
+    let sink = Request::new(Verb::Sink, Iri::parse(uri).unwrap())
+        .with_arg("content", ArgRef::Inline(b"new".to_vec()));
+    block_on(kernel.issue(sink, &cap)).unwrap();
+    assert_eq!(read(uri, None), b"new");
+    assert_eq!(
+        read("urn:file:searches", Some("text/uri-list")),
+        uri.as_bytes()
+    );
+    root.write("searches/café.rq", b"added");
+    assert_eq!(
+        read("urn:file:searches", Some("text/uri-list")),
+        b"urn:file:searches/caf%C3%A9.rq\nurn:file:searches/two%20words.rq"
+    );
+    let exists = Request::new(Verb::Exists, Iri::parse(uri).unwrap());
+    assert_eq!(
+        block_on(kernel.issue(exists.clone(), &cap)).unwrap().bytes,
+        b"true"
+    );
+    block_on(kernel.issue(Request::new(Verb::Delete, Iri::parse(uri).unwrap()), &cap)).unwrap();
+    assert_eq!(
+        block_on(kernel.issue(exists, &cap)).unwrap().bytes,
+        b"false"
+    );
+    assert_eq!(
+        read("urn:file:searches", Some("text/uri-list")),
+        b"urn:file:searches/caf%C3%A9.rq"
+    );
 }
