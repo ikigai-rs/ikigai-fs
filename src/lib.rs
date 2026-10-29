@@ -84,11 +84,15 @@
 //!
 //! `Source` hands back a **string by default** (a known text media type from the
 //! extension, or `text/plain` when the bytes decode as UTF-8); pass `as` =
-//! `application/octet-stream` to get the raw **bytes** instead. Any other `as` is
+//! `application/octet-stream` to get the raw **bytes** instead. `text/uri-list` selects
+//! full child URIs for directories. Other values are
 //! refused: this endpoint does not convert, so it will not relabel. A `Source` of a
 //! **directory** answers its listing: the names of its children a `Source` could serve
 //! (regular files and directories, no links, canonical names, `read` granted), sorted,
-//! one per line, the list a map `..` walks (ledger #2524). A listing is never cached,
+//! one per line (ledger #2524). Use `as=text/uri-list` for percent-encoded full
+//! `urn:file:` names a sourcing map can walk (ledger #2608). File URI paths use
+//! canonical uppercase UTF-8 percent escapes; only unreserved ASCII and `/` stay
+//! literal. A listing is never cached,
 //! on any mount: a file added cuts only its own thread, never its directory's. `Sink` writes
 //! UTF-8 `content` by default, or decodes it to bytes with `encoding=base64`.
 //! On Unix, Sink syncs a same-directory staging file before atomic publication,
@@ -291,11 +295,12 @@ impl FileEndpoint {
 /// A request that passed both layers of the jail: the walk's result and what
 /// the verb needs to be served.
 struct Admitted<'a> {
-    rel: &'a str,
+    rel: String,
     iri: &'a str,
     /// The path's names, canonical; the last is the leaf.
-    names: Vec<&'a str>,
+    names: Vec<String>,
     raw: bool,
+    uri_list: bool,
     /// The capability's rules for the verb's action, as judged the path.
     acl: Acl,
     found: backend::Found,
@@ -313,7 +318,11 @@ impl FileEndpoint {
         let iri = inv.request.target.as_str();
 
         // Layer 1, lexical half: the path's one spelling. No filesystem access yet.
-        let names = canonical_names(rel)?;
+        let decoded = decode_file_path(rel)?;
+        let names = canonical_names(&decoded)?;
+        if encode_file_path(&decoded) != rel {
+            return Err(deny("path must use canonical percent-encoding (UTF-8, uppercase hex; unreserved characters and / literal)"));
+        }
         let verb = inv.request.verb;
         let action = cap_action(verb).ok_or_else(|| {
             Error::Endpoint(format!("file endpoint does not support the {verb:?} verb"))
@@ -344,11 +353,20 @@ impl FileEndpoint {
 
         // Layer 1, structural half: walk the names from the root handle.
         let found = jail.probe(&names, iri)?;
+        let names = names.into_iter().map(str::to_owned).collect();
+        let uri_list = verb == Verb::Source && wants_uri_list(inv)?;
+        if uri_list && !found.is_dir() {
+            return Err(Error::InvalidArgument {
+                name: "as".into(),
+                detail: "text/uri-list is a directory listing face only".into(),
+            });
+        }
         Ok(Admitted {
-            rel,
+            rel: decoded,
             iri,
             names,
             raw,
+            uri_list,
             acl,
             found,
         })
@@ -356,7 +374,8 @@ impl FileEndpoint {
 
     /// A directory's `Source`: the names of its children, sorted, one per line with no
     /// trailing newline (the convention a map `..` splits on), as text, or as raw bytes
-    /// under `as=application/octet-stream` (ledger #2524).
+    /// under `as=application/octet-stream` (ledger #2524). `as=text/uri-list`
+    /// supplies canonical, percent-encoded full child URIs (ledger #2608).
     ///
     /// The jail's rules hold for the listing as for a read. The directory itself was
     /// walked and judged like any path (no link, its on-disk spelling, `read` granted on
@@ -376,6 +395,7 @@ impl FileEndpoint {
             iri,
             names,
             raw,
+            uri_list,
             acl,
             found,
             ..
@@ -385,13 +405,31 @@ impl FileEndpoint {
             if windows_meaning(&child).is_some() || is_staging_name(&child) {
                 continue;
             }
-            let path: Vec<&str> = names.iter().copied().chain([child.as_str()]).collect();
+            let path: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .chain([child.as_str()])
+                .collect();
             if acl.allows(&path) {
                 listed.push(child);
             }
         }
         listed.sort();
-        let repr_type = if raw {
+        if uri_list {
+            let parent = names.join("/");
+            listed = listed
+                .into_iter()
+                .map(|child| {
+                    format!(
+                        "urn:file:{}",
+                        encode_file_path(&format!("{parent}/{child}"))
+                    )
+                })
+                .collect();
+        }
+        let repr_type = if uri_list {
+            ReprType::new("text/uri-list")
+        } else if raw {
             ReprType::new(OCTET_STREAM)
         } else {
             ReprType::new("text/plain").with_param("charset", "utf-8")
@@ -435,7 +473,7 @@ impl Endpoint for FileEndpoint {
             found,
             ..
         } = admitted;
-        let leaf = names.last().copied().unwrap_or_default();
+        let leaf = names.last().map(String::as_str).unwrap_or_default();
         match inv.request.verb {
             Verb::Source => {
                 let bytes = found.read(iri)?;
@@ -490,7 +528,7 @@ impl Endpoint for FileEndpoint {
                 found,
                 ..
             } = admitted;
-            let leaf = names.last().copied().unwrap_or_default();
+            let leaf = names.last().map(String::as_str).unwrap_or_default();
             let (repr_type, body) = found.body(leaf, raw, iri)?;
             return Ok(self.source_answer(Representation::from_body(repr_type, body), iri));
         }
@@ -513,7 +551,7 @@ impl Endpoint for FileEndpoint {
                  exclusions win ties, default-deny). `Source` yields a string by default; \
                  `as=application/octet-stream` yields raw bytes; a missing file is NotFound. \
                  A `Source` of a directory yields its listing: the child names it may \
-                 serve, sorted, one per line (never cached).",
+                 serve, sorted, one per line (never cached); `as=text/uri-list` gives full child URIs.",
             )
             .verb(Verb::Source)
             .verb(Verb::Sink)
@@ -523,7 +561,7 @@ impl Endpoint for FileEndpoint {
             .input(
                 ArgSpec::new("path")
                     .summary(
-                        "Path relative to the endpoint root, spelled as on disk (no `.`, `..`, \
+                        "Path relative to the endpoint root, canonically percent-encoded UTF-8 (no `.`, `..`, \
                          empty segments, absolute paths or links).",
                     )
                     .class(XSD_STRING)
@@ -538,12 +576,13 @@ impl Endpoint for FileEndpoint {
             .input(sink_encoding_arg())
             .input(
                 ArgSpec::new("as")
-                    .summary("Source only: application/octet-stream for raw bytes; nothing else is accepted.")
+                    .summary("Source only: application/octet-stream for raw bytes; text/uri-list for full child URIs (directories only).")
                     .class(XSD_STRING)
-                    .one_of([OCTET_STREAM])
+                    .one_of([OCTET_STREAM, "text/uri-list"])
                     .optional(),
             )
             .output("text/plain;charset=utf-8")
+            .output("text/uri-list")
             // Per-verb contracts: the path-ACL is parameterized
             // (urn:cap:fs:<action>:<path>), so each action declares the wildcard
             // form — "holds SOME grant under this prefix" — for selection; the
@@ -554,15 +593,15 @@ impl Endpoint for FileEndpoint {
                     .requires("urn:cap:fs:read:*")
                     .input(
                         ArgSpec::new("path")
-                            .summary("relative to the jailed root")
+                            .summary("relative to the jailed root, canonical percent-encoded UTF-8")
                             .class(XSD_STRING)
                             .binding(),
                     )
                     .input(
                         ArgSpec::new("as")
-                            .summary("application/octet-stream for raw bytes")
+                            .summary("application/octet-stream for raw bytes; text/uri-list for full child URIs (directories only)")
                             .class(XSD_STRING)
-                            .one_of([OCTET_STREAM])
+                            .one_of([OCTET_STREAM, "text/uri-list"])
                             // Omitted: a string by default. No `default_value`,
                             // because the default is not one media type but
                             // "the extension's, else text/plain when UTF-8".
@@ -570,6 +609,7 @@ impl Endpoint for FileEndpoint {
                     )
                     .output("text/plain;charset=utf-8")
                     .output(OCTET_STREAM)
+                    .output("text/uri-list")
                     // `permanent`: a refused path, a missing file, and the
                     // `Conflict` a body ends with when the file changed while
                     // read. `over-budget`: the bytes path's 16 MiB bound.
@@ -584,7 +624,7 @@ impl Endpoint for FileEndpoint {
                     .requires("urn:cap:fs:read:*")
                     .input(
                         ArgSpec::new("path")
-                            .summary("relative to the jailed root")
+                            .summary("relative to the jailed root, canonical percent-encoded UTF-8")
                             .class(XSD_STRING)
                             .binding(),
                     )
@@ -596,7 +636,7 @@ impl Endpoint for FileEndpoint {
                     .requires("urn:cap:fs:write:*")
                     .input(
                         ArgSpec::new("path")
-                            .summary("relative to the jailed root")
+                            .summary("relative to the jailed root, canonical percent-encoded UTF-8")
                             .class(XSD_STRING)
                             .binding(),
                     )
@@ -624,7 +664,7 @@ impl Endpoint for FileEndpoint {
                     .requires("urn:cap:fs:delete:*")
                     .input(
                         ArgSpec::new("path")
-                            .summary("relative to the jailed root")
+                            .summary("relative to the jailed root, canonical percent-encoded UTF-8")
                             .class(XSD_STRING)
                             .binding(),
                     )
@@ -988,13 +1028,53 @@ fn wants_raw_bytes(inv: &Invocation<'_>) -> Result<bool> {
     if asked.eq_ignore_ascii_case(OCTET_STREAM) {
         return Ok(true);
     }
+    if asked.eq_ignore_ascii_case("text/uri-list") {
+        return Ok(false);
+    }
     Err(Error::InvalidArgument {
         name: "as".to_string(),
         detail: format!(
             "{asked:?} is not a face this endpoint serves: omit `as` for the file's own type, \
-             or pass `{OCTET_STREAM}` for raw bytes"
+             or pass `{OCTET_STREAM}` for raw bytes or `text/uri-list` for directory URIs"
         ),
     })
+}
+
+fn wants_uri_list(inv: &Invocation<'_>) -> Result<bool> {
+    Ok(inv.request.args.contains_key("as")
+        && inv.inline_str("as")?.eq_ignore_ascii_case("text/uri-list"))
+}
+
+/// One URI spelling per disk path, preserving only unreserved bytes and separators.
+fn encode_file_path(path: &str) -> String {
+    let mut out = String::new();
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(out, "%{byte:02X}").expect("writing a String");
+        }
+    }
+    out
+}
+
+fn decode_file_path(path: &str) -> Result<String> {
+    let mut out = Vec::new();
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let hi = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            let lo = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            let (Some(hi), Some(lo)) = (hi, lo) else {
+                return Err(deny("invalid percent escape in path"));
+            };
+            out.push((hi * 16 + lo) as u8);
+        } else {
+            out.push(byte);
+        }
+    }
+    String::from_utf8(out).map_err(|_| deny("percent-encoded path must be UTF-8"))
 }
 
 /// The path-ACL for one request: `capability`'s `urn:cap:fs:<action>:` scopes, each
