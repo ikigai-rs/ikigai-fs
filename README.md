@@ -443,6 +443,12 @@ where it saw answers:
   longer carry host paths, and `Exists` reports a failed check instead of `false`.
 - Windows refuses every request (it ran the path-checking jail these fixes replace).
 
+## Accessibility
+
+What this crate writes that people read (its refusals, acknowledgements and directory listings),
+the rules it follows and its known limitations are in [ACCESSIBILITY.md](ACCESSIBILITY.md).
+Report a barrier with an issue labeled `accessibility`.
+
 ## License
 
 MIT OR Apache-2.0
