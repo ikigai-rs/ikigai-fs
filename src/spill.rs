@@ -81,6 +81,8 @@ impl FileSpill {
     /// there, and nothing else.
     pub fn new(dir: impl AsRef<Path>) -> Result<Self> {
         let path = dir.as_ref();
+        // ambient: fs: the host-configured spill directory, opened once; every spill file is created relative to it
+        #[allow(clippy::disallowed_methods)]
         let dir = rfs::open(
             path,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
