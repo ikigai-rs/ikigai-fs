@@ -1400,6 +1400,8 @@ mod backend {
         /// configuration, not caller input). Fails closed: a root that cannot be
         /// opened serves nothing, and is never created.
         pub(super) fn open(root: &Path, iri: &str) -> Result<Jail> {
+            // ambient: fs: the jail's root handle, from the host-configured root; every caller name is then `openat` relative to it
+            #[allow(clippy::disallowed_methods)]
             let fd = rfs::open(
                 root,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -1411,9 +1413,12 @@ mod backend {
                      served until it exists"
                 ))
             })?;
+            // ambient: fs: canonicalizes the host-configured root path (never a request name) so capability scopes spelled through links still place
+            #[allow(clippy::disallowed_methods)]
+            let canonical = std::fs::canonicalize(root).ok();
             Ok(Jail {
                 root: fd,
-                canonical: std::fs::canonicalize(root).ok(),
+                canonical,
             })
         }
 
@@ -2314,7 +2319,10 @@ mod backend {
         let mut existing = path;
         let mut tail: Vec<&OsStr> = Vec::new();
         loop {
-            if let Ok(real) = std::fs::canonicalize(existing) {
+            // ambient: fs: resolves a host-issued capability DENY scope through links; only its existing prefix, never a request name
+            #[allow(clippy::disallowed_methods)]
+            let resolved = std::fs::canonicalize(existing);
+            if let Ok(real) = resolved {
                 let mut out = real;
                 out.extend(tail.iter().rev());
                 return Some(out);
