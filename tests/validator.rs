@@ -10,11 +10,13 @@ use std::time::Duration;
 
 use futures::executor::block_on;
 use ikigai_core::{
-    Bindings, Body, Capability, ContentId, Endpoint, EndpointSpace, Invocation, Iri, Kernel,
-    Replay, Request, UriTemplate, Verb,
+    Bindings, Body, Capability, ContentId, Endpoint, Invocation, Iri, Replay, Request, Verb,
 };
-use ikigai_fs::{FileEndpoint, FILE_TEMPLATE, VALIDATOR_SETTLE};
+use ikigai_core_for_old_modules as old;
+use ikigai_fs::{FileEndpoint, VALIDATOR_SETTLE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+mod old_core;
 
 struct Root(PathBuf);
 
@@ -161,6 +163,8 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// `ikigai-web` on core 0.2, in its own kernel (see `old_core`). When its core 0.3 release (the
+/// cli workspace, wave 5) is published, serve the file module from one kernel again.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_door_answers_a_range_of_a_large_file() {
     let root = Root::new("door");
@@ -168,17 +172,14 @@ async fn the_door_answers_a_range_of_a_large_file() {
     std::fs::write(root.path("big.bin"), &bytes).unwrap();
     settle();
 
-    let space = EndpointSpace::new().bind(
-        UriTemplate::parse(FILE_TEMPLATE).unwrap(),
-        FileEndpoint::new(&root.0),
-    );
-    let kernel = Arc::new(Kernel::new(Arc::new(space)));
+    let space = old_core::bind_file(old::EndpointSpace::new(), &root.0);
+    let kernel = Arc::new(old::Kernel::new(Arc::new(space)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(ikigai_web::serve_with_listener(
         kernel,
         // The jail and its path-ACL are what this test is not about: every request may read.
-        Arc::new(|_: &ikigai_web::HttpRequest| Capability::root()),
+        Arc::new(|_: &ikigai_web::HttpRequest| old::Capability::root()),
         listener,
         ikigai_web::EdgeConfig::default(),
     ));

@@ -53,7 +53,8 @@ futures = "0.3"
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`): walks every bound
 # endpoint and reports every violation at once. 0.12 enables BODIES and
-# BODY-INPUTS by default.
+# BODY-INPUTS by default. 0.14.0 is the conformance release on core 0.3 (the scoped
+# content store, ledger #2965).
 ikigai-conformance = "0.14.0"
 
 # The web door a file body is served through in `tests/validator.rs` (ledger #2474):
@@ -68,6 +69,15 @@ ikigai-engine = "0.2.6"
 ikigai-fn = "0.7.2"
 serde_json = "1"
 ikigai-sparql = "0.3.2"
+# TEST ONLY: the five crates above have no published release on core 0.3, which keeps core 0.2
+# in the test build and nowhere else. `ikigai-core-for-old-modules` names that core so
+# `tests/old_core/mod.rs` can drive them in a kernel of their own, with this crate's core 0.3
+# endpoint behind a bridge: only bytes and what frames them cross. Each crate's test returns to
+# one kernel when its release ships: ikigai-json and ikigai-fn (wave 1, merged, unpublished),
+# ikigai-engine (wave 3), ikigai-web (the cli workspace, wave 5), and ikigai-sparql (the
+# ikigai-linkeddata release, ledger #2991, which waits on this crate's). Wave 5 is the last
+# named, so this alias and the bridge go with the last of those.
+ikigai-core-for-old-modules = { package = "ikigai-core", version = "0.2.12" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]

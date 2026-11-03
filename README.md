@@ -308,6 +308,18 @@ One crate, a `cfg`-gated backend.
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
 
+## 0.4.0 (unreleased)
+
+- Move to `ikigai-core` 0.3.0 and `ikigai-conformance` 0.14.0: held content is
+  scoped to whoever delivered it (ledger #2965). **Minor version**: the public API
+  speaks core 0.3 types, so a host moves with core. The endpoint makes no
+  `ContentStore::put` call of its own: a `Sink` reads held content under the
+  caller's capability, so another principal's id is `NotFound`.
+- Test-only: `ikigai-web`, `ikigai-json`, `ikigai-engine`, `ikigai-fn` and
+  `ikigai-sparql` have no core 0.3 release yet, so their tests reach this crate
+  through a bridge from a core 0.2 kernel. A library build has core 0.3 alone.
+  Prepared only; do not publish.
+
 ## 0.3.0 (unreleased)
 
 - Add the opt-in directory `text/uri-list` face (ledger #2608), declared in the
