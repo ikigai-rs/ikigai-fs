@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-fs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Capability-gated file/store ikigai module: jailed to a root with a default-deny path-ACL; SOURCE/SINK/EXISTS/DELETE. A cfg-gated backend links into native (std::fs) and wasm32 (browser localStorage) hosts from one crate."
@@ -20,7 +20,8 @@ categories = ["filesystem", "wasm"]
 # `FileSpill` implements and uses (ledger #2372, #2241), are new there.
 # 0.2.3 is the first release with `ArgSpec::reads_body` (ledger #2402), which the Sink
 # declares on `content` so an attached body streams to disk (ledger #2469).
-ikigai-core = "0.2.3"
+# 0.3.0 scopes held content to its deliverer (scoped content store, ledger #2965).
+ikigai-core = "0.3.0"
 async-trait = "0.1"
 # Same vetted RFC 4648 implementation/profile as ikigai-http::base64.
 base64 = "0.22"
@@ -52,8 +53,9 @@ futures = "0.3"
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 # The module recipe as one test (`tests/conformance.rs`): walks every bound
 # endpoint and reports every violation at once. 0.12 enables BODIES and
-# BODY-INPUTS by default.
-ikigai-conformance = "0.12.0"
+# BODY-INPUTS by default. 0.14.0 is the conformance release on core 0.3 (the scoped
+# content store, ledger #2965).
+ikigai-conformance = "0.14.0"
 
 # The web door a file body is served through in `tests/validator.rs` (ledger #2474):
 # its `206`/`304` over a `Replay` that states a strong validator. Unix only, like the
@@ -67,6 +69,15 @@ ikigai-engine = "0.2.6"
 ikigai-fn = "0.7.2"
 serde_json = "1"
 ikigai-sparql = "0.3.2"
+# TEST ONLY: the five crates above have no published release on core 0.3, which keeps core 0.2
+# in the test build and nowhere else. `ikigai-core-for-old-modules` names that core so
+# `tests/old_core/mod.rs` can drive them in a kernel of their own, with this crate's core 0.3
+# endpoint behind a bridge: only bytes and what frames them cross. Each crate's test returns to
+# one kernel when its release ships: ikigai-json and ikigai-fn (wave 1, merged, unpublished),
+# ikigai-engine (wave 3), ikigai-web (the cli workspace, wave 5), and ikigai-sparql (the
+# ikigai-linkeddata release, ledger #2991, which waits on this crate's). Wave 5 is the last
+# named, so this alias and the bridge go with the last of those.
+ikigai-core-for-old-modules = { package = "ikigai-core", version = "0.2.12" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]

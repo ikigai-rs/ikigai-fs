@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::executor::block_on;
-use ikigai_core::{
-    ArgRef, Bindings, Capability, Endpoint, Exact, Invocation, Iri, Kernel, ReprType, Request, Verb,
-};
+use ikigai_core::{Bindings, Capability, Endpoint, Invocation, Iri, ReprType, Request, Verb};
+use ikigai_core_for_old_modules as old;
 use ikigai_fs::FileEndpoint;
+
+mod old_core;
 
 struct Root(PathBuf);
 
@@ -102,23 +103,29 @@ fn unknown_and_missing_extensions_keep_utf8_and_binary_fallbacks() {
     }
 }
 
+/// `ikigai-json` on core 0.2, in its own kernel (see `old_core`). When its core 0.3 release
+/// (wave 1) is published, bind it beside the file module in one kernel again.
 #[test]
 fn geojson_queries_answer_through_the_kernel_like_json() {
     let root = Root::new("query");
     let features = vec!["{}"; 178].join(",");
     let content = format!(r#"{{"type":"FeatureCollection","features":[{features}]}}"#);
-    let space = ikigai_fs::space(&root.0).bind(Exact::new("urn:json:query"), ikigai_json::query());
-    let kernel = Kernel::new(Arc::new(space));
+    let space =
+        old::EndpointSpace::new().bind(old::Exact::new("urn:json:query"), ikigai_json::query());
+    let kernel = old::Kernel::new(Arc::new(old_core::bind_file(space, &root.0)));
     for ext in ["json", "geojson"] {
         let name = format!("quakes-2024-01-01.{ext}");
         std::fs::write(root.0.join(&name), &content).unwrap();
-        let request = Request::new(Verb::Source, Iri::parse("urn:json:query").unwrap())
-            .with_arg(
-                "src",
-                ArgRef::Inline(format!("urn:file:{name}").into_bytes()),
-            )
-            .with_arg("q", ArgRef::Inline(b".features|length".to_vec()));
-        let answer = block_on(kernel.issue(request, &Capability::root())).unwrap();
+        let request = old::Request::new(
+            old::Verb::Source,
+            old::Iri::parse("urn:json:query").unwrap(),
+        )
+        .with_arg(
+            "src",
+            old::ArgRef::Inline(format!("urn:file:{name}").into_bytes()),
+        )
+        .with_arg("q", old::ArgRef::Inline(b".features|length".to_vec()));
+        let answer = block_on(kernel.issue(request, &old::Capability::root())).unwrap();
         assert_eq!(answer.bytes, b"178", "{ext}");
     }
 }

@@ -14,7 +14,10 @@ use futures::executor::block_on;
 use ikigai_core::{
     ArgRef, Bindings, Capability, Endpoint, Error, Invocation, Iri, Kernel, ReprType, Request, Verb,
 };
+use ikigai_core_for_old_modules as old;
 use ikigai_fs::FileEndpoint;
+
+mod old_core;
 
 struct Root(PathBuf);
 
@@ -250,18 +253,14 @@ fn a_directory_still_is_not_a_file_to_delete_or_sink() {
     assert!(Path::new(&root.0.join("searches/a.rq")).is_file());
 }
 
+/// `ikigai-engine`, `ikigai-sparql` and `ikigai-fn` on core 0.2, in their own kernel (see
+/// `old_core`). When all three have core 0.3 releases (wave 3 is the engine's), bind the file
+/// module beside them in one kernel again.
 fn saved_search_engine(root: &Root) -> ikigai_engine::Engine {
-    let space = ikigai_sparql::space()
-        .bind(
-            ikigai_core::Exact::new("urn:iki:fn:compose"),
-            ikigai_fn::compose(),
-        )
-        .bind(
-            ikigai_core::UriTemplate::parse(ikigai_fs::FILE_TEMPLATE).unwrap(),
-            FileEndpoint::new(&root.0),
-        );
-    ikigai_engine::Engine::new(Arc::new(Kernel::with_meta_renderer(
-        Arc::new(space),
+    let space =
+        ikigai_sparql::space().bind(old::Exact::new("urn:iki:fn:compose"), ikigai_fn::compose());
+    ikigai_engine::Engine::new(Arc::new(old::Kernel::with_meta_renderer(
+        Arc::new(old_core::bind_file(space, &root.0)),
         Arc::new(JsonRenderer),
     )))
 }
@@ -294,14 +293,14 @@ fn a_uri_listing_map_runs_both_saved_searches() {
 }
 
 struct JsonRenderer;
-impl ikigai_core::MetaRenderer for JsonRenderer {
+impl old::MetaRenderer for JsonRenderer {
     fn render(
         &self,
-        description: &ikigai_core::Description,
-        _: &ReprType,
-    ) -> ikigai_core::Result<ikigai_core::Representation> {
-        Ok(ikigai_core::Representation::new(
-            ReprType::new("application/json"),
+        description: &old::Description,
+        _: &old::ReprType,
+    ) -> old::Result<old::Representation> {
+        Ok(old::Representation::new(
+            old::ReprType::new("application/json"),
             serde_json::to_vec(description).unwrap(),
         ))
     }

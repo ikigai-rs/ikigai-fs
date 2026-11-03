@@ -6,7 +6,8 @@ publish = false
 
 [dependencies]
 ikigai-fs = { path = "../../.." }
-ikigai-core = "=0.2.7"
+# Match the local module's scoped content store types (ledger #2965).
+ikigai-core = "=0.3.0"
 futures = "0.3"
 notify = "=8.2.1"
 
