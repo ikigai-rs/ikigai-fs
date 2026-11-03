@@ -83,7 +83,7 @@ fn write_every_way(
         sink_request("inline", encoding).with_arg("content", ArgRef::Inline(content.to_vec())),
         &cap,
     ));
-    let held = store.put(content.to_vec()).unwrap();
+    let held = store.put_for(&cap, content.to_vec()).unwrap();
     let by_id = block_on(kernel.issue(
         sink_request("by-id", encoding).with_arg("content", ArgRef::Content(held.id())),
         &cap,
