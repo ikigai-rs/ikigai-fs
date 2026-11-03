@@ -239,7 +239,7 @@ fn inline_a_content_id_and_an_attached_body_write_identical_files() {
         let issue = |request: Request| block_on(kernel.issue(with_encoding(request), &cap));
 
         issue(sink_request("inline").with_arg("content", ArgRef::Inline(content.clone()))).unwrap();
-        let held = store.put(content.clone()).unwrap();
+        let held = store.put_for(&cap, content.clone()).unwrap();
         assert!(held.id().to_string().starts_with("b3:"));
         issue(sink_request("by-id").with_arg("content", ArgRef::Content(held.id()))).unwrap();
 
@@ -352,4 +352,25 @@ fn encoding_is_still_collected() {
         tracer.collected("urn:file:data.bin").as_deref(),
         Some("encoding")
     );
+}
+
+/// A caller can Sink content it delivered, but another principal cannot use that hold.
+#[test]
+fn a_content_id_is_scoped_to_the_delivering_principal() {
+    let root = Root::new("scoped-content");
+    let store = Arc::new(MemoryContentStore::new(1 << 20));
+    let kernel = kernel(&root.0).with_content_store(store.clone());
+    let session = Capability::scoped([format!("urn:cap:fs:write:{}", root.0.display())]);
+    let alice = session.with_principal("urn:example:person:alice").unwrap();
+    let bob = session.with_principal("urn:example:person:bob").unwrap();
+    let held = store.put_for(&alice, b"alice's bytes".to_vec()).unwrap();
+    let request = |name: &str| sink_request(name).with_arg("content", ArgRef::Content(held.id()));
+
+    block_on(kernel.issue(request("alice"), &alice)).unwrap();
+    assert_eq!(std::fs::read(root.path("alice")).unwrap(), b"alice's bytes");
+    assert!(matches!(
+        block_on(kernel.issue(request("bob"), &bob)),
+        Err(Error::NotFound(_))
+    ));
+    assert!(!root.path("bob").exists());
 }
