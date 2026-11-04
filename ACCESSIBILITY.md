@@ -11,7 +11,7 @@ decides how a person sees it. It is not a conformance claim. Adapted from the
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-fs/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-fs/security/advisories/new) |
-| Last reviewed | 2026-10-31 |
+| Last reviewed | 2026-11-03 |
 
 ## What it emits that people read
 
@@ -22,8 +22,10 @@ All of it is in `src/lib.rs` unless named otherwise.
   not its canonical spelling (with the spelling to use instead), a name that is not its on-disk
   spelling, a symbolic link, a directory where a file was asked for, a missing file
   (`` `urn:file:x` does not exist ``), a capability that does not grant the action, a write past
-  the root's ceiling, a read past the Source limit, a file that changed while read, and an `as`
-  this endpoint does not serve. The spill store (`src/spill.rs`) has its own errors.
+  the root's ceiling, a read past the Source limit, a file that changed while read, an `as`
+  this endpoint does not serve, and a conditional write's refusals: an `if-match` that is stale
+  (naming the current content id) or malformed, or that matches no file, a directory locked past
+  the wait, and a backend that cannot compare atomically. The spill store (`src/spill.rs`) has its own errors.
 - **Acknowledgements** (`text/plain`): `wrote N bytes to <path>` for a `Sink`, `deleted <path>`
   for a `Delete`, and `true` or `false` for an `Exists`.
 - **Directory listings**: a directory's `Source` is its child names, sorted, one per line
@@ -43,8 +45,9 @@ so it writes nothing to a terminal.
 - A refusal of a path says why in words, and where there is one right spelling it names it
   (``name the file `a/b` ``).
 - A refusal that the caller can fix by acting says so: a file that changed while read says
-  `read it again`, one that changed while served says `retry`, and an unsupported `as` lists the
-  values that are served.
+  `read it again`, one that changed while served says `retry`, a stale `if-match` says `read it
+  again` and names the current content id, a directory locked past the wait says `retry`, and an
+  unsupported `as` lists the values that are served.
 - No color, no terminal control codes and no markup are written.
 
 ## How it is tested
@@ -59,6 +62,10 @@ so it writes nothing to a terminal.
   that the refusal states the ceiling.
 - `tests/listing.rs`'s `a_directory_sources_as_the_newline_list_of_its_child_names` pins the
   listing's form.
+- `tests/if_match.rs`'s `a_stale_token_is_refused_naming_the_current_one_and_changes_nothing`
+  pins that a stale `if-match` names the request and the current content id, says `read it again`
+  and never names the host path; `a_missing_file_matches_no_token_and_nothing_is_created` and
+  `a_lock_held_past_the_wait_is_a_transient_refusal` pin the others' words the same way.
 
 The other messages are followed by reading and not tested. **No automated accessibility checker,
 browser or assistive technology has been used on this output.**
@@ -99,3 +106,4 @@ if you are comfortable sharing it. Anything security-sensitive goes through
 | Date | Change |
 |---|---|
 | 2026-10-31 | First version. |
+| 2026-11-03 | Listed and tested the conditional write's refusals. |

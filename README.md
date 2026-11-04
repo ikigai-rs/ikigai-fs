@@ -101,6 +101,7 @@ does the path-aware matching.
   (ownership, extended attributes, and hard-link identity are not preserved) and
   requires a writable parent directory. A killed process may leave an unpublished
   staging file. Power-loss durability of the directory entry is not guaranteed.
+  With `if-match` it is a [conditional write](#conditional-writes-ledger-3054).
 - `Exists` / `Delete` — existence check (a read) and removal (a delete).
 
 ### Directory listings (ledger #2524)
@@ -224,6 +225,51 @@ in localStorage, and falls back to existing `ikigai:fs:<root>/<path>` text entri
 New writes take precedence; deletion removes both entries. Older module versions
 cannot read the new namespace.
 
+### Conditional writes (ledger #3054)
+
+A `Sink` with `if-match` compares and replaces as one operation. The token is the
+content id of the `Source` representation read before editing
+(`Representation::content_id`: media type and bytes, under either `Source` face),
+as `b3:<hex>`. It is the binding `ikigai-name` asks of a writable
+`urn:name:registry-source`.
+
+- **Still current:** the file is replaced as any `Sink` replaces it.
+- **Stale:** `Conflict` naming the current content id; the file is untouched and no
+  staging file remains. Read again and reconsider the edit: `Conflict` is permanent
+  for that token, and the endpoint never retries.
+- **No such file:** `Conflict`, and nothing is created, directories included.
+- **Not a content id:** `InvalidArgument` naming `if-match`. A `Delete` with
+  `if-match` is refused the same way rather than deleting unconditionally.
+- **A file past 16 MiB:** `OverBudget`. The comparison reads the bytes, under the
+  `Source` bytes path's bound, and refuses rather than guess.
+
+**What makes it atomic.** The content is staged and synced first, unlocked. The
+comparison and the `renameat` then run under an exclusive `flock` on the parent
+directory, on a handle of the request's own, so a writer in another thread, another
+mount or another process waits for them. An unconditional `Sink` and a `Delete` take
+the lock too, since either landing between the comparison and the rename would be
+erased unseen. No lock file is added to the jail.
+
+**What it does not cover.**
+
+- A writer outside this crate (an editor, `mv`) takes no lock. It can land between
+  the comparison and the rename, and is then lost, as it would be to any `Sink`.
+- Anyone who can open the directory can hold its lock. A write waits at most
+  `LOCK_WAIT` (5 s), blocking its polling thread, then is refused with the transient
+  `Unavailable`, whether conditional or not.
+- A file system with no `flock` for a directory (some NFS setups) refuses `if-match`
+  with `Unsupported`, as it cannot keep the promise there; other writes go on unlocked.
+- The `wasm32` backend also refuses `if-match` with `Unsupported`: `localStorage` has
+  no compare across tabs.
+- A file replaced by one with the token's content but a new inode since the walk
+  answers the existing `Endpoint` error saying `retry`, not `Conflict`: the token still
+  holds, and the retry goes through.
+- A `Source` overlapping a replacement can answer `Conflict` (`changed while read`) or
+  the `retry` error, as before: read again.
+- On a `cacheable` mount a read cached across an out-of-band change states an old token,
+  and is refused as stale until the thread is cut.
+- A rename's durability across a power loss is as for any `Sink`: not guaranteed.
+
 ## Mounting
 
 ```rust
@@ -307,6 +353,19 @@ One crate, a `cfg`-gated backend.
   meaning on Windows is refused before that, as a path, on every platform, so a
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
+
+## 0.4.1 (unreleased)
+
+- **Conditional writes** (ledger #3054): a `Sink` with `if-match` compares the file's
+  `Source` content id and replaces it as one operation, or refuses with `Conflict`
+  naming the current one. See "Conditional writes" above. Additive for a caller, but
+  `if-match` is a new declared input, so **the Sink's contract IRI moves**, and `Sink`
+  now also declares the `transient` failure class.
+- `Sink` and `Delete` now take an exclusive `flock` on the parent directory around
+  publication, so a directory held locked past the new `LOCK_WAIT` (5 s) refuses them
+  with `Unavailable`. `rustix` must offer `flock`, which it does not on Solaris.
+- A `Delete` carrying `if-match` is now refused instead of ignoring it.
+  Prepared only; do not publish.
 
 ## 0.4.0 (unreleased)
 

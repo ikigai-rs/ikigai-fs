@@ -140,6 +140,30 @@
 //!
 //! [`ContentId`]: ikigai_core::ContentId
 //!
+//! ## Conditional writes
+//!
+//! A `Sink` with `if-match` replaces the file only if that token is still the content
+//! id of its `Source` representation ([`Representation::content_id`], its media type
+//! and bytes, under either `Source` face), and otherwise refuses with
+//! [`Error::Conflict`] naming the current one and leaves the file as it was (ledger
+//! #3054). A missing file matches no token: nothing is created. It is what a writable
+//! binding of `ikigai-name`'s `urn:name:registry-source` needs.
+//!
+//! On the native backend the content is staged as for any `Sink`; the comparison and
+//! the `renameat` then happen under an exclusive `flock` on the parent directory, so
+//! they are one operation to every writer through this crate: on any mount, in any
+//! process, conditional or not (an unconditional `Sink` and a `Delete` take the lock
+//! too). **A writer that does not go through this crate takes no lock**: an editor
+//! replacing the file between the comparison and the rename is lost, as it would be to
+//! any `Sink`. The bytes are read afresh for the comparison, so a file past
+//! [`MAX_FILE_SOURCE_BYTES`] is refused with [`Error::OverBudget`]. A lock another
+//! holder keeps past [`LOCK_WAIT`] refuses the write with the transient
+//! [`Error::Unavailable`]. On a file system with no `flock` for a directory a
+//! conditional write is refused with [`Error::Unsupported`], since it cannot be
+//! atomic there, and the other writes go ahead unlocked, as no conditional write can
+//! be in progress. The `wasm32` backend has no atomic compare across tabs, and refuses
+//! `if-match` the same way. Never ignored.
+//!
 //! ## Spilling
 //!
 //! On Unix, [`FileSpill`] is the file-backed spill facility (ledger #2241): a host
@@ -201,6 +225,13 @@ pub const MAX_FILE_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 /// common granularity (FAT's two-second times) and small clock skew to a network
 /// file server.
 pub const VALIDATOR_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a write waits for the lock on its parent directory before it is refused
+/// with the transient [`Error::Unavailable`]: 5 s. Writes hold it only for a comparison
+/// and a rename, so a wait this long means something else holds it, and anyone who can
+/// open the directory can; the wait blocks the polling thread, like all of this crate's
+/// file I/O, so it is bounded.
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The datatype every input of this module carries: a root-relative path, a
 /// media type, encoding, and content all arrive as strings on the wire and in
@@ -497,6 +528,14 @@ impl Endpoint for FileEndpoint {
                 }
             }
             Verb::Delete => {
+                if inv.request.args.contains_key("if-match") {
+                    return Err(Error::InvalidArgument {
+                        name: "if-match".to_string(),
+                        detail: "only a `Sink` compares; refused rather than deleted \
+                                 unconditionally"
+                            .to_string(),
+                    });
+                }
                 found.delete(iri)?;
                 Ok(ack(format!("deleted {rel}")))
             }
@@ -551,7 +590,9 @@ impl Endpoint for FileEndpoint {
                  exclusions win ties, default-deny). `Source` yields a string by default; \
                  `as=application/octet-stream` yields raw bytes; a missing file is NotFound. \
                  A `Source` of a directory yields its listing: the child names it may \
-                 serve, sorted, one per line (never cached); `as=text/uri-list` gives full child URIs.",
+                 serve, sorted, one per line (never cached); `as=text/uri-list` gives full child URIs. \
+                 A `Sink` with `if-match` replaces the file only while that is still the content id of \
+                 its `Source`, and otherwise refuses with Conflict naming the current one.",
             )
             .verb(Verb::Source)
             .verb(Verb::Sink)
@@ -574,6 +615,7 @@ impl Endpoint for FileEndpoint {
                     .optional(),
             )
             .input(sink_encoding_arg())
+            .input(sink_if_match_arg())
             .input(
                 ArgSpec::new("as")
                     .summary("Source only: application/octet-stream for raw bytes; text/uri-list for full child URIs (directories only).")
@@ -650,12 +692,16 @@ impl Endpoint for FileEndpoint {
                             .reads_body(),
                     )
                     .input(sink_encoding_arg())
+                    .input(sink_if_match_arg())
                     .output("text/plain;charset=utf-8")
                     // `permanent`: refused content or path, a `Conflict` from a
-                    // streamed content's source. `over-budget`: content past a
-                    // bound, the root's `max_write` among them. `unknown`: an I/O failure.
+                    // streamed content's source or a stale `if-match`. `over-budget`:
+                    // content past a bound, the root's `max_write` among them.
+                    // `transient`: the directory's lock held past `LOCK_WAIT`.
+                    // `unknown`: an I/O failure.
                     .fails(FailureClass::Permanent)
                     .fails(FailureClass::OverBudget)
+                    .fails(FailureClass::Transient)
                     .fails(FailureClass::Unknown),
             )
             .action(
@@ -811,6 +857,34 @@ fn sink_encoding_arg() -> ArgSpec {
         .default_value("utf-8")
 }
 
+fn sink_if_match_arg() -> ArgSpec {
+    ArgSpec::new("if-match")
+        .summary(
+            "Sink only: the content id of the Source representation read before editing. The \
+             file is replaced only while that is still its content id; otherwise Conflict names \
+             the current one. Omitted: an unconditional write.",
+        )
+        .class(XSD_STRING)
+        .optional()
+}
+
+/// The Sink's `if-match`, judged before any content is read.
+#[cfg(unix)]
+fn sink_if_match(inv: &Invocation<'_>) -> Result<Option<ikigai_core::ContentId>> {
+    if !inv.request.args.contains_key("if-match") {
+        return Ok(None);
+    }
+    let token = inv.inline_str("if-match")?;
+    ikigai_core::ContentId::parse(token)
+        .map(Some)
+        .map_err(|_| Error::InvalidArgument {
+            name: "if-match".to_string(),
+            detail: "expected a content id: `b3:` and 64 hex digits, as read from the file's \
+                     Source representation"
+                .to_string(),
+        })
+}
+
 /// How a Sink's `content` is encoded.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Encoding {
@@ -948,8 +1022,9 @@ impl Decoder {
 /// decoded whole before the disk is touched, as before bodies existed. A stream is
 /// decoded incrementally ([`Decoder`]) into the staging file chunk by chunk and
 /// published only once it ended cleanly: a stream that fails part-way, content
-/// that does not decode, or content past `max_write` (checked before each chunk
-/// reaches the disk) leaves the target untouched and no staging file behind.
+/// that does not decode, content past `max_write` (checked before each chunk
+/// reaches the disk), or an `if-match` that no longer holds at publication leaves the
+/// target untouched and no staging file behind.
 #[cfg(unix)]
 async fn sink(
     inv: &Invocation<'_>,
@@ -958,6 +1033,7 @@ async fn sink(
     max_write: u64,
 ) -> Result<u64> {
     let encoding = sink_encoding(inv)?;
+    let found = found.conditional(sink_if_match(inv)?);
     let body = inv.content_body("content").await?;
     if let Body::Bytes(bytes) = &body {
         let content = decode_whole(encoding, bytes)?;
@@ -992,6 +1068,16 @@ async fn sink(
     iri: &str,
     max_write: u64,
 ) -> Result<u64> {
+    // One `get_item` and one `set_item` are two operations to another tab of the origin.
+    if inv.request.args.contains_key("if-match") {
+        return Err(Error::Unsupported {
+            verb: Some(Verb::Sink),
+            detail: format!(
+                "`{iri}`: this backend cannot compare and replace atomically, so `if-match` is \
+                 refused rather than ignored; nothing was written"
+            ),
+        });
+    }
     let encoding = sink_encoding(inv)?;
     let collected = inv.collect(inv.content_body("content").await?).await?;
     let content = decode_whole(encoding, &collected)?;
@@ -1487,6 +1573,7 @@ mod backend {
                 reached: dirs.len(),
                 blocked: false,
                 leaf: leaf_stat,
+                if_match: None,
             })
         }
     }
@@ -1501,9 +1588,16 @@ mod backend {
         /// The walk stopped at a FILE where a directory was named.
         blocked: bool,
         leaf: Option<rfs::Stat>,
+        /// A write's `if-match`: the content id the file must still have when published.
+        if_match: Option<ikigai_core::ContentId>,
     }
 
     impl Found {
+        pub(super) fn conditional(mut self, if_match: Option<ikigai_core::ContentId>) -> Found {
+            self.if_match = if_match;
+            self
+        }
+
         fn short(dir: OwnedFd, names: &[&str], reached: usize, blocked: bool) -> Found {
             Found {
                 dir,
@@ -1511,6 +1605,7 @@ mod backend {
                 reached,
                 blocked,
                 leaf: None,
+                if_match: None,
             }
         }
 
@@ -1665,6 +1760,10 @@ mod backend {
             if let Some(stat) = &self.leaf {
                 require_regular(stat, &shown)?;
             }
+            // A missing file matches no token: refused before a directory is created.
+            if let (Some(token), None) = (self.if_match, &self.leaf) {
+                return Err(no_file_to_match(iri, token));
+            }
             // Create the missing directories, each relative to the handle on its
             // parent, and descend into each through a fresh no-follow open — so a
             // name swapped for a link meanwhile is refused, never followed.
@@ -1689,8 +1788,11 @@ mod backend {
             }
             let leaf = *all.last().expect("non-empty");
             // Retain the old handle until publication, checking the same inode the
-            // probe judged and enforcing the existing file's write permissions.
-            let old = if let Some(expected) = &self.leaf {
+            // probe judged and enforcing the existing file's write permissions. A
+            // conditional write adopts whichever file is there now: another writer may
+            // have replaced it since the probe, and the token, not the inode, decides.
+            let mut expected = self.leaf;
+            let old = if let Some(judged) = expected {
                 let fd = rfs::openat(
                     &dir,
                     leaf,
@@ -1699,26 +1801,33 @@ mod backend {
                 )
                 .map_err(|e| match e {
                     Errno::LOOP | Errno::MLINK => link_refused_shown(&shown),
-                    Errno::NOENT => changed(iri),
+                    Errno::NOENT => match self.if_match {
+                        Some(token) => no_file_to_match(iri, token),
+                        None => changed(iri),
+                    },
                     e => io_error("write", iri, e),
                 })?;
                 let now = rfs::fstat(&fd).map_err(|e| io_error("write", iri, e))?;
                 require_regular(&now, &shown)?;
-                if now.st_ino != expected.st_ino || now.st_dev != expected.st_dev {
-                    return Err(changed(iri));
+                if now.st_ino != judged.st_ino || now.st_dev != judged.st_dev {
+                    if self.if_match.is_none() {
+                        return Err(changed(iri));
+                    }
+                    expected = Some(now);
                 }
                 Some(fd)
             } else {
                 None
             };
 
-            let mode = Mode::from_raw_mode(if self.leaf.is_some() { 0o600 } else { 0o666 });
+            let mode = Mode::from_raw_mode(if expected.is_some() { 0o600 } else { 0o666 });
             let staged = Staged::create(dir, mode, iri)?;
             Ok(Pending {
                 staged,
                 leaf: leaf.to_string(),
                 names: self.names,
-                expected: self.leaf,
+                expected,
+                if_match: self.if_match,
                 old,
             })
         }
@@ -1732,6 +1841,8 @@ mod backend {
         names: Vec<String>,
         /// The file the walk judged, when one was there.
         expected: Option<rfs::Stat>,
+        /// The content id the file must still have when published.
+        if_match: Option<ikigai_core::ContentId>,
         /// A handle on that file, held until publication.
         old: Option<OwnedFd>,
     }
@@ -1748,12 +1859,18 @@ mod backend {
         /// Sync the staging file and publish it at the target: `renameat` over an
         /// existing file (an open reader keeps the old inode and its bytes), or
         /// `linkat` for a new one (never overwriting a name that appeared since).
+        ///
+        /// The directory's lock ([`lock_dir`]) spans the `if-match` comparison and the
+        /// publication, so a conditional write is one operation to every writer that
+        /// takes it. A replaced file with the token's content but another inode is
+        /// refused below as changed: the token held, so a retry goes through.
         pub(super) fn publish(self, iri: &str) -> Result<()> {
             let Pending {
                 staged,
                 leaf,
                 names,
                 expected,
+                if_match,
                 old,
             } = self;
             let shown = names.join("/");
@@ -1779,6 +1896,11 @@ mod backend {
             require_regular(&named_stat, &shown)?;
             if staged_stat.st_ino != named_stat.st_ino || staged_stat.st_dev != named_stat.st_dev {
                 return Err(changed(iri));
+            }
+
+            lock_dir(dir, if_match.is_some(), iri)?;
+            if let Some(token) = if_match {
+                require_token(dir, leaf, &shown, token, iri)?;
             }
 
             if let Some(expected) = &expected {
@@ -1820,12 +1942,84 @@ mod backend {
                     self.shown()
                 )));
             }
+            // Under the lock: a delete between a conditional write's comparison and its
+            // rename would be undone unseen.
+            lock_dir(&self.dir, false, iri)?;
             // `unlinkat` never follows a link: it removes the name the ACL judged.
             rfs::unlinkat(&self.dir, self.leaf_name(), AtFlags::empty()).map_err(|e| match e {
                 Errno::NOENT => not_found(iri),
                 e => io_error("delete", iri, e),
             })
         }
+    }
+
+    /// Take the exclusive `flock` on the directory, waiting at most [`LOCK_WAIT`]. Held
+    /// until the handle closes, which is when the request is done with it: each request
+    /// walks to its own handle, so requests exclude each other within a process as across
+    /// processes, and no file is added to the jail.
+    ///
+    /// A directory with no `flock` (`required` false: an unconditional write) goes on
+    /// unlocked, as it did before there were conditional writes: `required` writers are
+    /// refused there, so no comparison can be in progress for it to land inside.
+    fn lock_dir(dir: &OwnedFd, required: bool, iri: &str) -> Result<()> {
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match rfs::flock(dir, rfs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => return Ok(()),
+                Err(Errno::INTR) => {}
+                Err(Errno::WOULDBLOCK) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::Unavailable(format!(
+                            "`{iri}`: its directory stayed locked by another writer for {} s; \
+                             nothing was written; retry",
+                            LOCK_WAIT.as_secs()
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(_) if !required => return Ok(()),
+                Err(e) => {
+                    return Err(Error::Unsupported {
+                        verb: Some(Verb::Sink),
+                        detail: format!(
+                            "`{iri}`: `if-match` needs a lock on the file's directory, which \
+                             this file system refused ({e}); nothing was written"
+                        ),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Refuse unless `token` is the content id of the file's `Source` representation now,
+    /// by either face. Read and hashed here rather than taken from [`validators`]: that
+    /// digest is of the bytes alone, and a token has to be of what the file holds now.
+    /// The caller holds the directory's lock.
+    fn require_token(
+        dir: &OwnedFd,
+        leaf: &str,
+        shown: &str,
+        token: ikigai_core::ContentId,
+        iri: &str,
+    ) -> Result<()> {
+        let fd = open_leaf(dir, leaf, shown, iri).map_err(|e| match e {
+            Error::NotFound(_) => no_file_to_match(iri, token),
+            e => e,
+        })?;
+        let now = rfs::fstat(&fd).map_err(|e| io_error("read", iri, e))?;
+        require_regular(&now, shown)?;
+        let bytes = read_bounded(std::fs::File::from(fd), now.st_size, iri)?;
+        let current = Representation::new(source_type(leaf, &bytes, false), bytes);
+        let current_id = current.content_id();
+        if current_id == token
+            || Representation::new(ReprType::new(OCTET_STREAM), current.bytes).content_id() == token
+        {
+            return Ok(());
+        }
+        Err(Error::Conflict(format!(
+            "`{iri}` changed: `if-match` is {token}, and its current content id is \
+             {current_id}; nothing was written; read it again"
+        )))
     }
 
     /// The largest chunk a [`FileReplay`] reader yields.
@@ -2293,6 +2487,14 @@ mod backend {
     /// [`Replay`](ikigai_core::Replay) contract).
     fn changed_while_read(iri: &str) -> Error {
         Error::Conflict(format!("`{iri}` changed while read; read it again"))
+    }
+
+    /// A conditional write to a file that is not there.
+    fn no_file_to_match(iri: &str, token: ikigai_core::ContentId) -> Error {
+        Error::Conflict(format!(
+            "`{iri}` does not exist, so `if-match` {token} matches nothing; nothing was \
+             written; read it again"
+        ))
     }
 
     fn changed(iri: &str) -> Error {
