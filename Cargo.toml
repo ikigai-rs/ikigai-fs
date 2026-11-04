@@ -1,6 +1,6 @@
 [package]
 name = "ikigai-fs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Capability-gated file/store ikigai module: jailed to a root with a default-deny path-ACL; SOURCE/SINK/EXISTS/DELETE. A cfg-gated backend links into native (std::fs) and wasm32 (browser localStorage) hosts from one crate."
@@ -32,7 +32,7 @@ mime_guess = { version = "2", default-features = false }
 # its parent (`O_NOFOLLOW`, `O_DIRECTORY`), reads the directory to learn a name's
 # on-disk spelling, and reads/writes on the handle the walk produced. `rustix` is the
 # safe wrapper over exactly those calls (no `unsafe` here). 1.0 carries every call used
-# (`openat`, `statat`, `mkdirat`, `unlinkat`, `fstat`, `renameat`, `linkat`, `Dir::read_from`).
+# (`openat`, `statat`, `mkdirat`, `unlinkat`, `fstat`, `renameat`, `linkat`, `flock`, `Dir::read_from`).
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.0", features = ["fs"] }
 # Unpredictable names for exclusively-created, handle-relative staging files.
