@@ -57,11 +57,18 @@
 //! - `urn:cap:fs:read:/Users/brian/workspace` **+** `urn:cap:fs:read:-/Users/brian/workspace/secret`
 //!   — read the tree *except* `secret`.
 //!
-//! A scope is mapped into the jail before it is matched: its path is normalized
-//! (`.`, repeated and trailing `/` dropped), placed against the root under either
-//! of the root's spellings — as mounted, or canonical (`/private/var/…` for
-//! `/var/…`) — and the part inside the jail is resolved to its on-disk names. A
-//! scope naming the root or an ancestor of it covers the whole jail.
+//! A **relative** path names a path *inside the jail*: `urn:cap:fs:read:docs` is the
+//! jail's `docs/`, and `urn:cap:fs:read:.` the whole jail, whatever spelling the host
+//! mounted the root under and whatever the process's working directory (ledger
+//! #230). An allow with `..` is ignored; a deny's `..` that climbs out of the jail
+//! drops the rule.
+//!
+//! An **absolute** path names a host path. It is mapped into the jail before it is
+//! matched: normalized (`.`, repeated and trailing `/` dropped), placed against the
+//! root under either of the root's spellings — as mounted, or canonical
+//! (`/private/var/…` for `/var/…`) — and the part inside the jail is resolved to
+//! its on-disk names. A scope naming the root or an ancestor of it covers the whole
+//! jail.
 //!
 //! Matching is **most specific wins, by path depth**, with **deny breaking
 //! ties**: for an `(action, path)`, the deepest rule whose directory contains the
@@ -586,7 +593,8 @@ impl Endpoint for FileEndpoint {
                  every request: the structural jail (the path is walked from the root without \
                  following links; `..`, absolute paths, links and any spelling but the on-disk \
                  one are refused) and the capability path-ACL \
-                 (`urn:cap:fs:<read|write|delete>:<path>`, deepest rule wins, `-`-prefixed \
+                 (`urn:cap:fs:<read|write|delete>:<path>`, a relative path naming a path inside \
+                 the jail and an absolute one a host path; deepest rule wins, `-`-prefixed \
                  exclusions win ties, default-deny). `Source` yields a string by default; \
                  `as=application/octet-stream` yields raw bytes; a missing file is NotFound. \
                  A `Source` of a directory yields its listing: the child names it may \
@@ -1290,8 +1298,16 @@ impl Rule {
     /// spelling is tried once more with its existing prefix resolved through the
     /// host's links, so a deny spelled through a link to the jail still binds;
     /// allows get no such leniency.
+    ///
+    /// A relative path (`docs`, `.`) is jail-relative: it names a path inside the
+    /// jail, whatever spelling the host mounted the root under and whatever the
+    /// process's working directory (ledger #230). It is never placed against a root
+    /// spelling, and a deny's `..` that would climb out of the jail drops the rule.
     fn map(dir: &str, allows: bool, roots: &Roots, jail: &backend::Jail) -> Option<Rule> {
         let scope = lexical(Path::new(dir), !allows)?;
+        if is_jail_relative(Path::new(dir)) {
+            return Some(Rule::within(scope, allows, jail));
+        }
         let placed = roots
             .spellings
             .iter()
@@ -1305,16 +1321,21 @@ impl Rule {
             })?;
         Some(match placed {
             Placed::Covers(depth) => Rule::Covers(depth),
-            Placed::Within(rest) if rest.is_empty() => Rule::Covers(0),
-            Placed::Within(rest) => {
-                let (names, on_disk) = jail.on_disk_names(&rest);
-                Rule::Within {
-                    names,
-                    on_disk,
-                    deny: !allows,
-                }
-            }
+            Placed::Within(rest) => Rule::within(rest, allows, jail),
         })
+    }
+
+    /// The rule for `rest`, a normalized path inside the jail (empty: the root).
+    fn within(rest: Vec<OsString>, allows: bool, jail: &backend::Jail) -> Rule {
+        if rest.is_empty() {
+            return Rule::Covers(0);
+        }
+        let (names, on_disk) = jail.on_disk_names(&rest);
+        Rule::Within {
+            names,
+            on_disk,
+            deny: !allows,
+        }
     }
 
     fn depth(&self) -> i64 {
@@ -1352,6 +1373,16 @@ impl Rule {
 enum Placed {
     Covers(i64),
     Within(Vec<OsString>),
+}
+
+/// Whether a scope's path is jail-relative: it starts with a name, `.` or `..`, not
+/// with a root directory or (on Windows) a prefix such as `C:`. An empty path is
+/// the jail root.
+fn is_jail_relative(path: &Path) -> bool {
+    !matches!(
+        path.components().next(),
+        Some(Component::RootDir | Component::Prefix(_))
+    )
 }
 
 /// Place a normalized scope path against one spelling of the root.
@@ -3409,6 +3440,60 @@ mod tests {
         let err = invoke(&ep, Verb::Sink, "public/x.txt", &c, &[("content", b"x")]).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A relative scope names a path INSIDE the jail (ledger #230): its meaning is the
+    /// same whichever spelling the host mounted the root under, and never depends on
+    /// the process's working directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_scope_is_jail_relative_whatever_the_root_spelling() {
+        // One jail under the test's working directory, mounted twice: by the relative
+        // spelling and by the absolute one.
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let relative = PathBuf::from(format!(
+            "target/ikigai-fs-relscope-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(relative.join("docs")).unwrap();
+        std::fs::write(relative.join("docs/a.txt"), b"a").unwrap();
+        std::fs::write(relative.join("top.txt"), b"t").unwrap();
+        let absolute = std::env::current_dir().unwrap().join(&relative);
+        let mounts = [FileEndpoint::new(&relative), FileEndpoint::new(&absolute)];
+        let spelled = relative.display().to_string();
+        for ep in &mounts {
+            // `docs` is the jail's `docs/`, under either mount.
+            let c = cap(&["urn:cap:fs:read:docs"]);
+            assert!(invoke(ep, Verb::Source, "docs/a.txt", &c, &[]).is_ok());
+            assert!(matches!(
+                invoke(ep, Verb::Source, "top.txt", &c, &[]),
+                Err(Error::Denied(_))
+            ));
+            // `.` is the whole jail; a jail-relative deny carves out of it.
+            let c = cap(&["urn:cap:fs:read:.", "urn:cap:fs:read:-docs"]);
+            assert!(invoke(ep, Verb::Source, "top.txt", &c, &[]).is_ok());
+            assert!(matches!(
+                invoke(ep, Verb::Source, "docs/a.txt", &c, &[]),
+                Err(Error::Denied(_))
+            ));
+            // The root's own relative spelling is no longer the root: it names a
+            // path inside the jail, so it grants nothing here.
+            let c = cap(&[&format!("urn:cap:fs:read:{spelled}")]);
+            assert!(matches!(
+                invoke(ep, Verb::Source, "top.txt", &c, &[]),
+                Err(Error::Denied(_))
+            ));
+            // A relative scope cannot climb out of the jail to cover it.
+            let c = cap(&["urn:cap:fs:read:docs/../.."]);
+            assert!(invoke(ep, Verb::Source, "top.txt", &c, &[]).is_err());
+            let c = cap(&["urn:cap:fs:read:.", "urn:cap:fs:read:-../x"]);
+            assert!(invoke(ep, Verb::Source, "top.txt", &c, &[]).is_ok());
+            // An absolute scope still names the host path, under either mount.
+            let c = cap(&[&read_scope(&absolute)]);
+            assert!(invoke(ep, Verb::Source, "top.txt", &c, &[]).is_ok());
+        }
+        std::fs::remove_dir_all(&relative).ok();
     }
 
     // --- links, kinds and handles (native) ------------------------------------------
