@@ -164,6 +164,15 @@
 //! be in progress. The `wasm32` backend has no atomic compare across tabs, and refuses
 //! `if-match` the same way. Never ignored.
 //!
+//! A `Sink` with `if-none-match=*` writes the file only if it does not exist yet, and
+//! otherwise refuses with [`Error::Conflict`] and leaves the file as it was (ledger
+//! #3297). The new file is published with `linkat`, which cannot overwrite a name, so
+//! this needs no comparison and holds on a file system with no `flock` too. A create
+//! that loses to another writer between the walk and the `linkat` is the same
+//! `Conflict`, with or without the condition, so a caller can tell a lost race from a
+//! failure by its kind. The `wasm32` backend refuses `if-none-match` as it refuses
+//! `if-match`.
+//!
 //! ## Spilling
 //!
 //! On Unix, [`FileSpill`] is the file-backed spill facility (ledger #2241): a host
@@ -528,13 +537,15 @@ impl Endpoint for FileEndpoint {
                 }
             }
             Verb::Delete => {
-                if inv.request.args.contains_key("if-match") {
-                    return Err(Error::InvalidArgument {
-                        name: "if-match".to_string(),
-                        detail: "only a `Sink` compares; refused rather than deleted \
-                                 unconditionally"
-                            .to_string(),
-                    });
+                for condition in ["if-match", "if-none-match"] {
+                    if inv.request.args.contains_key(condition) {
+                        return Err(Error::InvalidArgument {
+                            name: condition.to_string(),
+                            detail: "only a `Sink` compares; refused rather than deleted \
+                                     unconditionally"
+                                .to_string(),
+                        });
+                    }
                 }
                 found.delete(iri)?;
                 Ok(ack(format!("deleted {rel}")))
@@ -592,7 +603,9 @@ impl Endpoint for FileEndpoint {
                  A `Source` of a directory yields its listing: the child names it may \
                  serve, sorted, one per line (never cached); `as=text/uri-list` gives full child URIs. \
                  A `Sink` with `if-match` replaces the file only while that is still the content id of \
-                 its `Source`, and otherwise refuses with Conflict naming the current one.",
+                 its `Source`, and otherwise refuses with Conflict naming the current one. \
+                 A `Sink` with `if-none-match=*` writes the file only if it does not exist yet, and \
+                 otherwise refuses with Conflict.",
             )
             .verb(Verb::Source)
             .verb(Verb::Sink)
@@ -616,6 +629,7 @@ impl Endpoint for FileEndpoint {
             )
             .input(sink_encoding_arg())
             .input(sink_if_match_arg())
+            .input(sink_if_none_match_arg())
             .input(
                 ArgSpec::new("as")
                     .summary("Source only: application/octet-stream for raw bytes; text/uri-list for full child URIs (directories only).")
@@ -693,9 +707,11 @@ impl Endpoint for FileEndpoint {
                     )
                     .input(sink_encoding_arg())
                     .input(sink_if_match_arg())
+                    .input(sink_if_none_match_arg())
                     .output("text/plain;charset=utf-8")
                     // `permanent`: refused content or path, a `Conflict` from a
-                    // streamed content's source or a stale `if-match`. `over-budget`:
+                    // streamed content's source, a stale `if-match`, an existing
+                    // file under `if-none-match` or a lost create. `over-budget`:
                     // content past a bound, the root's `max_write` among them.
                     // `transient`: the directory's lock held past `LOCK_WAIT`.
                     // `unknown`: an I/O failure.
@@ -868,6 +884,16 @@ fn sink_if_match_arg() -> ArgSpec {
         .optional()
 }
 
+fn sink_if_none_match_arg() -> ArgSpec {
+    ArgSpec::new("if-none-match")
+        .summary(
+            "Sink only: `*` writes the file only if it does not exist yet; otherwise Conflict. \
+             Omitted: an unconditional write. Not with if-match.",
+        )
+        .class(XSD_STRING)
+        .optional()
+}
+
 /// The Sink's `if-match`, judged before any content is read.
 #[cfg(unix)]
 fn sink_if_match(inv: &Invocation<'_>) -> Result<Option<ikigai_core::ContentId>> {
@@ -883,6 +909,32 @@ fn sink_if_match(inv: &Invocation<'_>) -> Result<Option<ikigai_core::ContentId>>
                      Source representation"
                 .to_string(),
         })
+}
+
+/// Whether the Sink carries `if-none-match=*`, judged before any content is read. The
+/// value is compared here rather than by a declared `one_of`, so that every other value
+/// and a request that also carries `if-match` are refused in one place.
+#[cfg(unix)]
+fn sink_create_only(inv: &Invocation<'_>) -> Result<bool> {
+    if !inv.request.args.contains_key("if-none-match") {
+        return Ok(false);
+    }
+    let refused = |detail: &str| Error::InvalidArgument {
+        name: "if-none-match".to_string(),
+        detail: detail.to_string(),
+    };
+    if inv.inline_str("if-none-match")? != "*" {
+        return Err(refused(
+            "expected `*`, the one value this endpoint serves: write only if the file does not \
+             exist yet",
+        ));
+    }
+    if inv.request.args.contains_key("if-match") {
+        return Err(refused(
+            "`if-match` needs the file to exist and `if-none-match` needs it not to: send one",
+        ));
+    }
+    Ok(true)
 }
 
 /// How a Sink's `content` is encoded.
@@ -1023,8 +1075,8 @@ impl Decoder {
 /// decoded incrementally ([`Decoder`]) into the staging file chunk by chunk and
 /// published only once it ended cleanly: a stream that fails part-way, content
 /// that does not decode, content past `max_write` (checked before each chunk
-/// reaches the disk), or an `if-match` that no longer holds at publication leaves the
-/// target untouched and no staging file behind.
+/// reaches the disk), an `if-match` that no longer holds at publication, or a create
+/// that lost to another writer leaves the target untouched and no staging file behind.
 #[cfg(unix)]
 async fn sink(
     inv: &Invocation<'_>,
@@ -1033,7 +1085,7 @@ async fn sink(
     max_write: u64,
 ) -> Result<u64> {
     let encoding = sink_encoding(inv)?;
-    let found = found.conditional(sink_if_match(inv)?);
+    let found = found.conditional(sink_if_match(inv)?, sink_create_only(inv)?);
     let body = inv.content_body("content").await?;
     if let Body::Bytes(bytes) = &body {
         let content = decode_whole(encoding, bytes)?;
@@ -1069,14 +1121,19 @@ async fn sink(
     max_write: u64,
 ) -> Result<u64> {
     // One `get_item` and one `set_item` are two operations to another tab of the origin.
-    if inv.request.args.contains_key("if-match") {
-        return Err(Error::Unsupported {
-            verb: Some(Verb::Sink),
-            detail: format!(
-                "`{iri}`: this backend cannot compare and replace atomically, so `if-match` is \
-                 refused rather than ignored; nothing was written"
-            ),
-        });
+    for (condition, what) in [
+        ("if-match", "compare and replace"),
+        ("if-none-match", "check and create"),
+    ] {
+        if inv.request.args.contains_key(condition) {
+            return Err(Error::Unsupported {
+                verb: Some(Verb::Sink),
+                detail: format!(
+                    "`{iri}`: this backend cannot {what} atomically, so `{condition}` is \
+                     refused rather than ignored; nothing was written"
+                ),
+            });
+        }
     }
     let encoding = sink_encoding(inv)?;
     let collected = inv.collect(inv.content_body("content").await?).await?;
@@ -1574,6 +1631,7 @@ mod backend {
                 blocked: false,
                 leaf: leaf_stat,
                 if_match: None,
+                create_only: false,
             })
         }
     }
@@ -1590,11 +1648,18 @@ mod backend {
         leaf: Option<rfs::Stat>,
         /// A write's `if-match`: the content id the file must still have when published.
         if_match: Option<ikigai_core::ContentId>,
+        /// A write's `if-none-match=*`: the file must not exist yet.
+        create_only: bool,
     }
 
     impl Found {
-        pub(super) fn conditional(mut self, if_match: Option<ikigai_core::ContentId>) -> Found {
+        pub(super) fn conditional(
+            mut self,
+            if_match: Option<ikigai_core::ContentId>,
+            create_only: bool,
+        ) -> Found {
             self.if_match = if_match;
+            self.create_only = create_only;
             self
         }
 
@@ -1606,6 +1671,7 @@ mod backend {
                 blocked,
                 leaf: None,
                 if_match: None,
+                create_only: false,
             }
         }
 
@@ -1759,6 +1825,10 @@ mod backend {
             }
             if let Some(stat) = &self.leaf {
                 require_regular(stat, &shown)?;
+                // A name that appears after this is refused by `linkat` at publication.
+                if self.create_only {
+                    return Err(already_exists(iri));
+                }
             }
             // A missing file matches no token: refused before a directory is created.
             if let (Some(token), None) = (self.if_match, &self.leaf) {
@@ -1858,7 +1928,8 @@ mod backend {
 
         /// Sync the staging file and publish it at the target: `renameat` over an
         /// existing file (an open reader keeps the old inode and its bytes), or
-        /// `linkat` for a new one (never overwriting a name that appeared since).
+        /// `linkat` for a new one (never overwriting a name that appeared since, and
+        /// answering [`Error::Conflict`] when one did).
         ///
         /// The directory's lock ([`lock_dir`]) spans the `if-match` comparison and the
         /// publication, so a conditional write is one operation to every writer that
@@ -1921,7 +1992,7 @@ mod backend {
                 // since the probe. Drop removes only the temporary second name.
                 rfs::linkat(dir, staged.name.as_str(), dir, leaf, AtFlags::empty()).map_err(
                     |e| match e {
-                        Errno::EXIST => changed(iri),
+                        Errno::EXIST => lost_create(iri),
                         e => io_error("publish", iri, e),
                     },
                 )?;
@@ -2494,6 +2565,22 @@ mod backend {
         Error::Conflict(format!(
             "`{iri}` does not exist, so `if-match` {token} matches nothing; nothing was \
              written; read it again"
+        ))
+    }
+
+    /// A create-only write (`if-none-match=*`) to a file that is there.
+    fn already_exists(iri: &str) -> Error {
+        Error::Conflict(format!(
+            "`{iri}` already exists, and `if-none-match` is `*`; nothing was written; read it \
+             again"
+        ))
+    }
+
+    /// A create that another writer's create beat to the name.
+    fn lost_create(iri: &str) -> Error {
+        Error::Conflict(format!(
+            "`{iri}` was created by another writer while this request was being served; nothing \
+             was written; read it again"
         ))
     }
 

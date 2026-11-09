@@ -101,7 +101,8 @@ does the path-aware matching.
   (ownership, extended attributes, and hard-link identity are not preserved) and
   requires a writable parent directory. A killed process may leave an unpublished
   staging file. Power-loss durability of the directory entry is not guaranteed.
-  With `if-match` it is a [conditional write](#conditional-writes-ledger-3054).
+  With `if-match` it is a [conditional write](#conditional-writes-ledger-3054), and
+  with `if-none-match=*` a [create-only write](#create-only-writes-ledger-3297).
 - `Exists` / `Delete` — existence check (a read) and removal (a delete).
 
 ### Directory listings (ledger #2524)
@@ -270,6 +271,36 @@ erased unseen. No lock file is added to the jail.
   and is refused as stale until the thread is cut.
 - A rename's durability across a power loss is as for any `Sink`: not guaranteed.
 
+### Create-only writes (ledger #3297)
+
+A `Sink` with `if-none-match=*` writes the file only if it does not exist yet, so a
+writer creating a file cannot overwrite one another writer created a moment earlier.
+
+- **No such file:** it is created as any `Sink` creates it, missing directories
+  included.
+- **The file exists, even empty:** `Conflict` saying it already exists; the file is
+  untouched and no staging file remains. Read it and reconsider: the endpoint never
+  retries.
+- **A directory at the name:** the `InvalidArgument` any `Sink` gets for one.
+- **Any value but `*`:** `InvalidArgument` naming `if-none-match`, and so is sending
+  `if-match` too, since no file satisfies both. A `Delete` with `if-none-match` is
+  refused the same way rather than deleting unconditionally.
+
+**A lost create is a `Conflict`, with or without the condition.** Publishing a new
+file uses `linkat`, which cannot overwrite a name, so of any number of writers that
+found the name free exactly one creates it. Every other is refused with `Conflict`
+saying another writer created it, and its content is not written. An unconditional
+`Sink` that tries again replaces the file, as it always would. The refusal does not
+depend on the directory's lock: `linkat` refuses a name however it appeared, an
+editor's included, and on a file system with no `flock`.
+
+**What it does not cover.**
+
+- The `wasm32` backend refuses `if-none-match` with `Unsupported`: `localStorage` has
+  no check-and-create across tabs.
+- Only a create is covered. A file replaced or removed since the walk found it
+  answers the existing `Endpoint` error saying `retry`.
+
 ## Mounting
 
 ```rust
@@ -353,6 +384,18 @@ One crate, a `cfg`-gated backend.
   meaning on Windows is refused before that, as a path, on every platform, so a
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
+
+## 0.4.2 (unreleased)
+
+- **Create-only writes** (ledger #3297): a `Sink` with `if-none-match=*` writes the
+  file only if it does not exist yet, and otherwise refuses with `Conflict`. See
+  "Create-only writes" above. Additive for a caller, but `if-none-match` is a new
+  declared input, so **the Sink's contract IRI moves**.
+- A create that loses the race to another writer now answers `Conflict` instead of
+  the `Endpoint` error saying `retry`. A caller matching that message for a create
+  must match the kind instead.
+- A `Delete` carrying `if-none-match` is refused instead of ignoring it.
+  Prepared only; do not publish.
 
 ## 0.4.1 (unreleased)
 
