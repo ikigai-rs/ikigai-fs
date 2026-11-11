@@ -27,6 +27,9 @@ async-trait = "0.1"
 base64 = "0.22"
 # Vetted extension table shared with hosts; pure data, including on wasm32.
 mime_guess = { version = "2", default-features = false }
+# Canonical decomposition, so a deny on a name not yet on disk binds every spelling a
+# normalization-insensitive volume (macOS's APFS) opens as that name; pure, wasm32 too.
+unicode-normalization = "0.1.26"
 
 # Native backend: the jail resolves every name with `openat` relative to a handle on
 # its parent (`O_NOFOLLOW`, `O_DIRECTORY`), reads the directory to learn a name's
