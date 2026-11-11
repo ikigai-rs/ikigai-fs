@@ -66,11 +66,16 @@ A scope is placed into the jail before it is matched. Its path is normalized (`.
 repeated and trailing `/` dropped), then placed against the root under **either of
 the root's spellings** — as mounted, or canonical, so `/private/var/…` and `/var/…`
 name one jail on macOS — and the part inside the jail is resolved to its on-disk
-names. A scope naming the root or an ancestor of it covers the whole jail.
+names. A scope naming the root or an ancestor of it covers the whole jail. A deny is
+placed a second time with the existing part of its path resolved through the host's
+links, so a deny spelled through a link — to the jail, or inside it
+(`-/ws/current/secret` where `current` links to `releases/v2`) — also binds the file
+the link leads to; an allow is never widened that way.
 
 Matching is **most specific wins, by path depth; deny breaks ties**; no matching
 rule is **default-deny**; a `root` capability allows everything *within the jail*.
 A deny that names something not yet on disk is compared without regard to case
+or Unicode normalization (`café` composed or decomposed: one name to macOS's APFS)
 (the volume's rule for a name that does not exist cannot be read off the volume),
 which can only over-deny; an allow is never widened that way. These are
 owner-minted rule sets — the flat-scope `Capability` is untouched and this module

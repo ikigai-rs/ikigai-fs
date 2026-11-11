@@ -61,15 +61,19 @@
 //! (`.`, repeated and trailing `/` dropped), placed against the root under either
 //! of the root's spellings — as mounted, or canonical (`/private/var/…` for
 //! `/var/…`) — and the part inside the jail is resolved to its on-disk names. A
-//! scope naming the root or an ancestor of it covers the whole jail.
+//! scope naming the root or an ancestor of it covers the whole jail. A deny is
+//! placed once more with its existing prefix resolved through the host's links,
+//! so one spelled through a link to the jail or inside it also binds the file the
+//! link leads to; an allow never is.
 //!
 //! Matching is **most specific wins, by path depth**, with **deny breaking
 //! ties**: for an `(action, path)`, the deepest rule whose directory contains the
 //! path decides; if a deny ties it, it's denied. No matching rule →
 //! **default-deny**. A `root` capability allows everything *within the jail*.
 //! Where a deny names something not on disk, it is compared without regard to
-//! case, since the volume's rule for a name that does not exist cannot be read
-//! off the volume; that can only over-deny. These are owner-minted rule sets — the
+//! case or Unicode normalization (`café` composed or decomposed), since the
+//! volume's rule for a name that does not exist cannot be read off the volume;
+//! that can only over-deny. These are owner-minted rule sets — the
 //! flat-scope [`Capability`] is untouched; this module does the path-aware
 //! matching, where path semantics belong.
 //!
@@ -1259,7 +1263,17 @@ impl Acl {
                     Some(d) => (false, d),
                     None => (true, rest),
                 };
-                if let Some(rule) = Rule::map(dir, rule_allows, &roots, jail) {
+                let rule = Rule::map(dir, rule_allows, &roots, jail);
+                // A deny binds the file it names however it is spelled: one spelled
+                // through a link inside the jail (`current/secret` for
+                // `releases/v2/secret`) binds the name the link resolves to as well,
+                // the only one the jail serves it under. Allows get no such leniency.
+                let resolved = if rule_allows {
+                    None
+                } else {
+                    Rule::map_resolved(dir, &roots, jail)
+                };
+                for rule in rule.into_iter().chain(resolved) {
                     rules.push((rule, rule_allows));
                 }
             }
@@ -1343,24 +1357,30 @@ impl Rule {
     ///
     /// The path is normalized lexically first (so `/ws/secret/` and `/ws/secret` are
     /// one directory, of one depth). An allow containing `..` is ignored (fail
-    /// closed); a deny's `..` is applied lexically. A deny that matches neither root
-    /// spelling is tried once more with its existing prefix resolved through the
-    /// host's links, so a deny spelled through a link to the jail still binds;
-    /// allows get no such leniency.
+    /// closed); a deny's `..` is applied lexically. A deny is also mapped a second
+    /// time, through the host's links ([`Rule::map_resolved`]); allows get no such
+    /// leniency.
     fn map(dir: &str, allows: bool, roots: &Roots, jail: &backend::Jail) -> Option<Rule> {
         let scope = lexical(Path::new(dir), !allows)?;
         let placed = roots
             .spellings
             .iter()
-            .find_map(|root| place(&scope, root))
-            .or_else(|| {
-                if allows {
-                    return None;
-                }
-                let resolved = backend::resolve_host_path(Path::new(dir))?;
-                place(&lexical(&resolved, true)?, roots.canonical.as_deref()?)
-            })?;
-        Some(match placed {
+            .find_map(|root| place(&scope, root))?;
+        Some(Rule::of(placed, !allows, jail))
+    }
+
+    /// A deny's path with its existing prefix resolved through the host's links, mapped
+    /// into the jail against the canonical root, or `None` when it resolves outside it:
+    /// so a deny spelled through a link to the jail, or through a link inside it, binds
+    /// the file the link leads to.
+    fn map_resolved(dir: &str, roots: &Roots, jail: &backend::Jail) -> Option<Rule> {
+        let resolved = backend::resolve_host_path(Path::new(dir))?;
+        let placed = place(&lexical(&resolved, true)?, roots.canonical.as_deref()?)?;
+        Some(Rule::of(placed, true, jail))
+    }
+
+    fn of(placed: Placed, deny: bool, jail: &backend::Jail) -> Rule {
+        match placed {
             Placed::Covers(depth) => Rule::Covers(depth),
             Placed::Within(rest) if rest.is_empty() => Rule::Covers(0),
             Placed::Within(rest) => {
@@ -1368,10 +1388,10 @@ impl Rule {
                 Rule::Within {
                     names,
                     on_disk,
-                    deny: !allows,
+                    deny,
                 }
             }
-        })
+        }
     }
 
     fn depth(&self) -> i64 {
@@ -1395,7 +1415,8 @@ impl Rule {
                     && names.iter().zip(target).enumerate().all(|(i, (rule, t))| {
                         if *deny && i >= *on_disk {
                             // A deny naming something not on disk: the volume's case
-                            // rule for it is unknowable, so compare without case.
+                            // and normalization rules for it are unknowable, so compare
+                            // without either.
                             caseless_eq(rule, t)
                         } else {
                             rule.as_os_str() == OsStr::new(t)
@@ -1450,9 +1471,13 @@ fn lexical(path: &Path, resolve_parents: bool) -> Option<Vec<OsString>> {
     Some(out)
 }
 
+/// Whether a volume that folds case or Unicode normalization could open `a` and `b` as
+/// one name: equal once each is lowercased and canonically decomposed (NFD), so `Café`,
+/// `café` composed and `cafe\u{301}` decomposed all match. Used only to over-deny.
 fn caseless_eq(a: &OsStr, b: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
     match a.to_str() {
-        Some(a) => a == b || a.to_lowercase() == b.to_lowercase(),
+        Some(a) => a == b || a.to_lowercase().nfd().eq(b.to_lowercase().nfd()),
         None => false,
     }
 }
@@ -2600,7 +2625,7 @@ mod backend {
     }
 
     /// A host path with its existing prefix resolved through links (the rest kept as
-    /// written). Used only to place a DENY scope spelled through a link to the jail.
+    /// written). Used only to place a DENY scope spelled through a link.
     pub(super) fn resolve_host_path(path: &Path) -> Option<PathBuf> {
         if !path.is_absolute() {
             return None;
@@ -3495,6 +3520,72 @@ mod tests {
         )]);
         let err = invoke(&ep, Verb::Sink, "public/x.txt", &c, &[("content", b"x")]).unwrap_err();
         assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_deny_on_a_name_not_yet_on_disk_binds_without_regard_to_normalization() {
+        // `café.txt` composed (NFC, U+00E9) and decomposed (NFD, `e` + U+0301) are one
+        // name to macOS's APFS: the volume's normalization rule for a name that does
+        // not exist cannot be read off the volume either, so the deny over-denies.
+        let root = temp_root();
+        let ep = FileEndpoint::new(&root);
+        let c = cap(&[
+            &write_scope(&root),
+            &format!("urn:cap:fs:write:-{}", root.join("caf\u{e9}.txt").display()),
+        ]);
+        let err = invoke(&ep, Verb::Sink, "cafe%CC%81.txt", &c, &[("content", b"x")]).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "nothing was created"
+        );
+        // The same holds the other way round, and past a case difference too.
+        let c = cap(&[
+            &write_scope(&root),
+            &format!("urn:cap:fs:write:-{}", root.join("Cafe\u{301}").display()),
+        ]);
+        let err = invoke(&ep, Verb::Sink, "caf%C3%A9/x.txt", &c, &[("content", b"x")]).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "nothing was created"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deny_spelled_through_a_link_inside_the_jail_binds_the_file_it_names() {
+        // `current` is a link to `releases/v2`: the owner's deny on
+        // `current/secret.txt` names `releases/v2/secret.txt`, the only spelling the
+        // jail serves it under.
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("releases/v2")).unwrap();
+        std::fs::write(root.join("releases/v2/secret.txt"), b"PRIVATE").unwrap();
+        std::fs::write(root.join("releases/v2/open.txt"), b"public").unwrap();
+        std::os::unix::fs::symlink("releases/v2", root.join("current")).unwrap();
+        let ep = FileEndpoint::new(&root);
+        {
+            let deny = root.join("current/secret.txt");
+            let c = cap(&[
+                &read_scope(&root),
+                &format!("urn:cap:fs:read:-{}", deny.display()),
+            ]);
+            let read = invoke(&ep, Verb::Source, "releases/v2/secret.txt", &c, &[]);
+            assert!(matches!(read, Err(Error::Denied(_))), "{deny:?}: {read:?}");
+            let listed = invoke(&ep, Verb::Source, "releases/v2", &c, &[]).unwrap();
+            assert_eq!(listed.bytes, b"open.txt", "{deny:?}");
+        }
+        // An ALLOW spelled through the link is never widened to the target.
+        let c = cap(&[&format!(
+            "urn:cap:fs:read:{}",
+            root.join("current").display()
+        )]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]);
+        assert!(matches!(read, Err(Error::Denied(_))), "{read:?}");
         std::fs::remove_dir_all(&root).ok();
     }
 
