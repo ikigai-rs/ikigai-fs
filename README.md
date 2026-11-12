@@ -128,6 +128,10 @@ source urn:file:searches as=text/uri-list .. ( urn:iki:fn:compose | urn:sparql:s
 `urn:file:searches/rss.rq`. The face uses newline separators with no trailing
 newline, so a map has no empty final member. A child directory is included too;
 source its URI to list its members. Empty directories answer an empty list.
+On Unix, `source urn:file:` lists the jail root itself. Its empty path needs
+`read` on the root, and child URIs have no leading slash. Both standard mounts
+accept this root URI. A missing jail root or file returns `Error::NotFound`;
+other failures to open the root remain endpoint errors.
 `text/uri-list` is accepted only for directories; files refuse it rather than
 relabel their content. Both the face and its `as` choice are declared on Source.
 
@@ -137,6 +141,8 @@ letters, digits, `-._~` and the `/` separators stay literal. For example,
 `%`, `#`, `?` and newlines in names are escaped too. Decoding happens before
 the jail and path-ACL checks; alternate encodings (including escaped `/` or
 unreserved bytes) are refused, preserving one URI per file and its cache thread.
+Hosts can call `ikigai_fs::encode_file_path` with a decoded, jail-relative UTF-8
+path and prepend `urn:file:` to obtain that same URI for watcher cache cuts.
 
 The jail's rules hold for the listing as for a read. The directory is walked like any
 path (no link, its on-disk spelling, `searches/` refused as not canonical) and needs

@@ -207,14 +207,35 @@ use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ActionSpec, ArgSpec, Body, Capability, Description, Endpoint, EndpointSpace, Error,
-    FailureClass, Invocation, ReprType, Representation, Result, UriTemplate, Verb,
+    ActionSpec, ArgSpec, Bindings, Body, Capability, Description, Endpoint, EndpointSpace, Error,
+    FailureClass, Grammar, Invocation, Iri, ReprType, Representation, Result, UriTemplate, Verb,
 };
 
 /// The conventional grammar a host mounts this module at: `urn:file:{path}`,
 /// where `{path}` is captured root-relative and handed to the endpoint as the
 /// `path` binding (so the file's *identity* is the request, not an argument).
+/// The standard mounts also accept `urn:file:` with an empty binding to list the jail root.
 pub const FILE_TEMPLATE: &str = "urn:file:{path}";
+
+// Core's URI template requires nonempty captures. The conventional file mount
+// also accepts the empty path, which names the jail root.
+struct FileGrammar(UriTemplate);
+
+impl Grammar for FileGrammar {
+    fn match_iri(&self, iri: &Iri) -> Option<Bindings> {
+        if iri.as_str() == "urn:file:" {
+            let mut bindings = Bindings::new();
+            bindings.insert("path", "");
+            Some(bindings)
+        } else {
+            self.0.match_iri(iri)
+        }
+    }
+
+    fn pattern(&self) -> String {
+        FILE_TEMPLATE.to_string()
+    }
+}
 
 /// Maximum native file payload returned by a `Source`: 16 MiB.
 ///
@@ -262,7 +283,7 @@ const OCTET_STREAM: &str = "application/octet-stream";
 /// want a different IRI grammar can bind [`FileEndpoint`] themselves.
 pub fn space(root: impl Into<PathBuf>) -> EndpointSpace {
     EndpointSpace::new().bind(
-        UriTemplate::parse(FILE_TEMPLATE).expect("FILE_TEMPLATE is a valid template"),
+        FileGrammar(UriTemplate::parse(FILE_TEMPLATE).expect("FILE_TEMPLATE is a valid template")),
         FileEndpoint::new(root),
     )
 }
@@ -273,7 +294,7 @@ pub fn space(root: impl Into<PathBuf>) -> EndpointSpace {
 /// kernel that auto-cuts on writes (`ikigai-core` ≥ 0.1.9).
 pub fn cacheable_space(root: impl Into<PathBuf>) -> EndpointSpace {
     EndpointSpace::new().bind(
-        UriTemplate::parse(FILE_TEMPLATE).expect("FILE_TEMPLATE is a valid template"),
+        FileGrammar(UriTemplate::parse(FILE_TEMPLATE).expect("FILE_TEMPLATE is a valid template")),
         FileEndpoint::new(root).cacheable(),
     )
 }
@@ -466,7 +487,11 @@ impl FileEndpoint {
                 .map(|child| {
                     format!(
                         "urn:file:{}",
-                        encode_file_path(&format!("{parent}/{child}"))
+                        encode_file_path(&if parent.is_empty() {
+                            child
+                        } else {
+                            format!("{parent}/{child}")
+                        })
                     )
                 })
                 .collect();
@@ -756,8 +781,12 @@ fn cap_action(verb: Verb) -> Option<&'static str> {
 /// A path is accepted only in its one canonical spelling — `/`-separated names, none
 /// empty, none `.` or `..`, not absolute, none with another meaning on Windows
 /// ([`windows_meaning`]) — so two IRIs can never name one file through spelling alone. A
-/// refusal of a non-canonical spelling names the canonical one.
+/// refusal of a non-canonical spelling names the canonical one. The empty path
+/// names the jail root; it has no segments.
 fn canonical_names(rel: &str) -> Result<Vec<&str>> {
+    if rel.is_empty() {
+        return Ok(Vec::new());
+    }
     let names: Vec<&str> = rel.split('/').collect();
     if names.contains(&"..") {
         return Err(deny("parent-directory (`..`) segments are not allowed"));
@@ -1192,11 +1221,25 @@ fn wants_uri_list(inv: &Invocation<'_>) -> Result<bool> {
         && inv.inline_str("as")?.eq_ignore_ascii_case("text/uri-list"))
 }
 
-/// One URI spelling per disk path, preserving only unreserved bytes and separators.
+/// Encode a UTF-8 relative path for the path portion of a `urn:file:` URI.
+///
+/// Preserves unreserved ASCII bytes and `/`; all other UTF-8 bytes become
+/// uppercase percent escapes. Hosts can use this spelling to cut the same cache
+/// thread the endpoint uses after a watcher observes a path change. Pass the
+/// decoded path relative to the jail, without the `urn:file:` prefix.
+/// This encodes the path; the endpoint still validates its spelling and authority.
+///
+/// ```
+/// use ikigai_fs::encode_file_path;
+/// assert_eq!(
+///     format!("urn:file:{}", encode_file_path("queries/café notes.rq")),
+///     "urn:file:queries/caf%C3%A9%20notes.rq"
+/// );
+/// ```
 // Keep this local: ikigai_core::encode_name preserves non-ASCII IRI characters,
 // while file paths require ASCII-only URIs with uppercase UTF-8 escapes and literal
 // unreserved bytes and `/`. Re-encoding after decoding enforces that one spelling.
-fn encode_file_path(path: &str) -> String {
+pub fn encode_file_path(path: &str) -> String {
     let mut out = String::new();
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
@@ -1576,6 +1619,9 @@ mod backend {
                 Mode::empty(),
             )
             .map_err(|e| {
+                if e == Errno::NOENT {
+                    return not_found(iri);
+                }
                 Error::Endpoint(format!(
                     "`{iri}`: the endpoint's jail root cannot be opened ({e}); nothing is \
                      served until it exists"
@@ -1629,7 +1675,18 @@ mod backend {
         /// anything. Refuses a link anywhere and a spelling that is not the on-disk
         /// one; stops quietly at the first name that does not exist.
         pub(super) fn probe(self, names: &[&str], iri: &str) -> Result<Found> {
-            let (leaf, dirs) = names.split_last().expect("canonical_names is non-empty");
+            let Some((leaf, dirs)) = names.split_last() else {
+                let stat = rfs::fstat(&self.root).map_err(|e| io_error("look up", iri, e))?;
+                return Ok(Found {
+                    dir: self.root,
+                    names: Vec::new(),
+                    reached: 0,
+                    blocked: false,
+                    leaf: Some(stat),
+                    if_match: None,
+                    create_only: false,
+                });
+            };
             let mut dir = self.root;
             for (reached, name) in dirs.iter().enumerate() {
                 match step(&dir, name, &names[..=reached], iri)? {
@@ -1701,7 +1758,8 @@ mod backend {
         }
 
         fn leaf_name(&self) -> &str {
-            self.names.last().expect("non-empty")
+            // An empty name list denotes the opened root directory itself.
+            self.names.last().map(String::as_str).unwrap_or(".")
         }
 
         fn shown(&self) -> String {
@@ -3291,7 +3349,8 @@ mod tests {
                 "{bad}: {err:?}"
             );
         }
-        for bad in ["", ".", "/abs", "../up", "a/../b", "nul\0byte"] {
+        assert!(canonical_names("").unwrap().is_empty());
+        for bad in [".", "/abs", "../up", "a/../b", "nul\0byte"] {
             assert!(
                 matches!(canonical_names(bad), Err(Error::InvalidArgument { .. })),
                 "{bad:?}"
