@@ -182,7 +182,16 @@ fn a_linked_or_misspelled_directory_is_refused_as_a_read_is() {
     root.write("searches/a.rq", b"a");
     let endpoint = FileEndpoint::new(&root.0);
     let all = Capability::root();
-    for rel in ["linked", "searches/", "./searches", "searches//", "../x"] {
+    for rel in [
+        ".",
+        "./",
+        "/",
+        "linked",
+        "searches/",
+        "./searches",
+        "searches//",
+        "../x",
+    ] {
         let err = source(&endpoint, rel, &all).unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument { .. }),
@@ -475,4 +484,103 @@ fn uri_listings_stay_live_and_encoded_file_writes_cut_their_cache_thread() {
         read("urn:file:searches", Some("text/uri-list")),
         b"urn:file:searches/caf%C3%A9.rq"
     );
+}
+
+#[test]
+fn the_jail_root_lists_through_the_kernel_with_canonical_child_uris() {
+    let root = Root::new("root-listing");
+    root.write("two words.rq", b"query");
+    root.write("nested/file.rq", b"nested");
+    let kernel = Kernel::new(Arc::new(ikigai_fs::space(&root.0)));
+    for (face, expected) in [
+        (None, "nested\ntwo words.rq"),
+        (
+            Some("text/uri-list"),
+            "urn:file:nested\nurn:file:two%20words.rq",
+        ),
+    ] {
+        let mut request = Request::new(Verb::Source, Iri::parse("urn:file:").unwrap());
+        if let Some(face) = face {
+            request = request.with_arg("as", ArgRef::Inline(face.as_bytes().to_vec()));
+        }
+        let answer = block_on(kernel.issue(request, &Capability::root())).unwrap();
+        assert_eq!(answer.bytes, expected.as_bytes());
+    }
+}
+
+#[test]
+fn a_missing_jail_root_and_a_missing_file_are_not_found() {
+    let root = Root::new("missing-root");
+    let absent = root.0.join("absent");
+    for endpoint in [FileEndpoint::new(&root.0), FileEndpoint::new(&absent)] {
+        let err = source(&endpoint, "override.txt", &Capability::root()).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        assert!(!err.to_string().contains(&root.0.display().to_string()));
+    }
+    assert!(!absent.exists());
+    root.write("file", b"not a directory");
+    let err = source(
+        &FileEndpoint::new(root.0.join("file")),
+        "override.txt",
+        &Capability::root(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Endpoint(_)), "{err:?}");
+}
+
+#[test]
+fn hosts_can_encode_the_same_escaped_paths_the_endpoint_lists() {
+    let root = Root::new("public-encoder");
+    root.write("queries/two words café.rq", b"query");
+    let encoded = ikigai_fs::encode_file_path("queries/two words café.rq");
+    assert_eq!(encoded, "queries/two%20words%20caf%C3%A9.rq");
+    let endpoint = FileEndpoint::new(&root.0);
+    assert_eq!(
+        source(&endpoint, &encoded, &Capability::root()).unwrap().1,
+        "query"
+    );
+    assert_eq!(
+        source_face(
+            &endpoint,
+            "queries",
+            &Capability::root(),
+            Some("text/uri-list")
+        )
+        .unwrap()
+        .1,
+        format!("urn:file:{encoded}")
+    );
+}
+
+#[test]
+fn root_listings_enforce_the_directory_grant_and_filter_children() {
+    let root = Root::new("root-acl");
+    root.write("public.txt", b"public");
+    root.write("secret.txt", b"secret");
+    std::os::unix::fs::symlink(root.0.join("secret.txt"), root.0.join("link")).unwrap();
+    let endpoint = FileEndpoint::new(&root.0);
+    let granted = Capability::scoped([
+        format!("urn:cap:fs:read:{}", root.0.display()),
+        format!("urn:cap:fs:read:-{}/secret.txt", root.0.display()),
+    ]);
+    assert_eq!(source(&endpoint, "", &granted).unwrap().1, "public.txt");
+    let child_only =
+        Capability::scoped([format!("urn:cap:fs:read:{}/public.txt", root.0.display())]);
+    assert!(matches!(
+        source(&endpoint, "", &child_only),
+        Err(Error::Denied(_))
+    ));
+    for verb in [Verb::Sink, Verb::Delete] {
+        let request = Request::new(verb, Iri::parse("urn:file:").unwrap())
+            .with_arg("content", ArgRef::Inline(b"replacement".to_vec()));
+        let mut bindings = Bindings::new();
+        bindings.insert("path", "");
+        let cap = Capability::root();
+        let inv = Invocation::detached(&request, &bindings, &cap);
+        assert!(matches!(
+            block_on(endpoint.invoke(&inv)),
+            Err(Error::InvalidArgument { .. })
+        ));
+    }
+    assert_eq!(std::fs::read(root.0.join("public.txt")).unwrap(), b"public");
 }
