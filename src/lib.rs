@@ -57,14 +57,23 @@
 //! - `urn:cap:fs:read:/Users/brian/workspace` **+** `urn:cap:fs:read:-/Users/brian/workspace/secret`
 //!   — read the tree *except* `secret`.
 //!
-//! A scope is mapped into the jail before it is matched: its path is normalized
-//! (`.`, repeated and trailing `/` dropped), placed against the root under either
-//! of the root's spellings — as mounted, or canonical (`/private/var/…` for
-//! `/var/…`) — and the part inside the jail is resolved to its on-disk names. A
-//! scope naming the root or an ancestor of it covers the whole jail. A deny is
-//! placed once more with its existing prefix resolved through the host's links,
-//! so one spelled through a link to the jail or inside it also binds the file the
-//! link leads to; an allow never is.
+//! A scope's path is normalized first (`.`, repeated and trailing `/` dropped).
+//!
+//! A **relative** path names a path *inside the jail*: `urn:cap:fs:read:docs` is the
+//! jail's `docs/`, and `urn:cap:fs:read:.` the whole jail, whatever spelling the host
+//! mounted the root under and whatever the process's working directory (ledger
+//! #230). An allow with `..` is ignored; a deny's `..` that climbs out of the jail
+//! drops the rule.
+//!
+//! An **absolute** path names a host path. It is placed against the root under
+//! either of the root's spellings — as mounted, or canonical (`/private/var/…` for
+//! `/var/…`). A scope naming the root or an ancestor of it covers the whole jail.
+//!
+//! The part inside the jail is resolved to its on-disk names. A deny is placed once
+//! more with its existing prefix resolved through the host's links (a relative one
+//! from the jail's canonical root, never from the working directory), so one spelled
+//! through a link to the jail or inside it also binds the file the link leads to; an
+//! allow never is.
 //!
 //! Matching is **most specific wins, by path depth**, with **deny breaking
 //! ties**: for an `(action, path)`, the deepest rule whose directory contains the
@@ -626,7 +635,8 @@ impl Endpoint for FileEndpoint {
                  every request: the structural jail (the path is walked from the root without \
                  following links; `..`, absolute paths, links and any spelling but the on-disk \
                  one are refused) and the capability path-ACL \
-                 (`urn:cap:fs:<read|write|delete>:<path>`, deepest rule wins, `-`-prefixed \
+                 (`urn:cap:fs:<read|write|delete>:<path>`, a relative path naming a path inside \
+                 the jail and an absolute one a host path; deepest rule wins, `-`-prefixed \
                  exclusions win ties, default-deny). `Source` yields a string by default; \
                  `as=application/octet-stream` yields raw bytes; a missing file is NotFound. \
                  A `Source` of a directory yields its listing: the child names it may \
@@ -1403,8 +1413,16 @@ impl Rule {
     /// closed); a deny's `..` is applied lexically. A deny is also mapped a second
     /// time, through the host's links ([`Rule::map_resolved`]); allows get no such
     /// leniency.
+    ///
+    /// A relative path (`docs`, `.`) is jail-relative: it names a path inside the
+    /// jail, whatever spelling the host mounted the root under and whatever the
+    /// process's working directory (ledger #230). It is never placed against a root
+    /// spelling, and a deny's `..` that would climb out of the jail drops the rule.
     fn map(dir: &str, allows: bool, roots: &Roots, jail: &backend::Jail) -> Option<Rule> {
         let scope = lexical(Path::new(dir), !allows)?;
+        if is_jail_relative(Path::new(dir)) {
+            return Some(Rule::of(Placed::Within(scope), !allows, jail));
+        }
         let placed = roots
             .spellings
             .iter()
@@ -1416,9 +1434,21 @@ impl Rule {
     /// into the jail against the canonical root, or `None` when it resolves outside it:
     /// so a deny spelled through a link to the jail, or through a link inside it, binds
     /// the file the link leads to.
+    ///
+    /// A jail-relative deny is resolved from the jail's canonical root, never from the
+    /// process's working directory (ledger #230); its `..` is applied lexically first,
+    /// as [`Rule::map`] does, and one that climbs out of the jail maps to nothing.
     fn map_resolved(dir: &str, roots: &Roots, jail: &backend::Jail) -> Option<Rule> {
-        let resolved = backend::resolve_host_path(Path::new(dir))?;
-        let placed = place(&lexical(&resolved, true)?, roots.canonical.as_deref()?)?;
+        let canonical = roots.canonical.as_deref()?;
+        let host = if is_jail_relative(Path::new(dir)) {
+            let mut host = jail.canonical_root()?;
+            host.extend(lexical(Path::new(dir), true)?);
+            host
+        } else {
+            PathBuf::from(dir)
+        };
+        let resolved = backend::resolve_host_path(&host)?;
+        let placed = place(&lexical(&resolved, true)?, canonical)?;
         Some(Rule::of(placed, true, jail))
     }
 
@@ -1473,6 +1503,16 @@ impl Rule {
 enum Placed {
     Covers(i64),
     Within(Vec<OsString>),
+}
+
+/// Whether a scope's path is jail-relative: it starts with a name, `.` or `..`, not
+/// with a root directory or (on Windows) a prefix such as `C:`. An empty path is
+/// the jail root.
+fn is_jail_relative(path: &Path) -> bool {
+    !matches!(
+        path.components().next(),
+        Some(Component::RootDir | Component::Prefix(_))
+    )
 }
 
 /// Place a normalized scope path against one spelling of the root.
@@ -3582,6 +3622,60 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A relative scope names a path INSIDE the jail (ledger #230): its meaning is the
+    /// same whichever spelling the host mounted the root under, and never depends on
+    /// the process's working directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_scope_is_jail_relative_whatever_the_root_spelling() {
+        // One jail under the test's working directory, mounted twice: by the relative
+        // spelling and by the absolute one.
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let relative = PathBuf::from(format!(
+            "target/ikigai-fs-relscope-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(relative.join("docs")).unwrap();
+        std::fs::write(relative.join("docs/a.txt"), b"a").unwrap();
+        std::fs::write(relative.join("top.txt"), b"t").unwrap();
+        let absolute = std::env::current_dir().unwrap().join(&relative);
+        let mounts = [FileEndpoint::new(&relative), FileEndpoint::new(&absolute)];
+        let spelled = relative.display().to_string();
+        for ep in &mounts {
+            // `docs` is the jail's `docs/`, under either mount.
+            let c = cap(&["urn:cap:fs:read:docs"]);
+            assert!(invoke(ep, Verb::Source, "docs/a.txt", &c, &[]).is_ok());
+            assert!(matches!(
+                invoke(ep, Verb::Source, "top.txt", &c, &[]),
+                Err(Error::Denied(_))
+            ));
+            // `.` is the whole jail; a jail-relative deny carves out of it.
+            let c = cap(&["urn:cap:fs:read:.", "urn:cap:fs:read:-docs"]);
+            assert!(invoke(ep, Verb::Source, "top.txt", &c, &[]).is_ok());
+            assert!(matches!(
+                invoke(ep, Verb::Source, "docs/a.txt", &c, &[]),
+                Err(Error::Denied(_))
+            ));
+            // The root's own relative spelling is no longer the root: it names a
+            // path inside the jail, so it grants nothing here.
+            let c = cap(&[&format!("urn:cap:fs:read:{spelled}")]);
+            assert!(matches!(
+                invoke(ep, Verb::Source, "top.txt", &c, &[]),
+                Err(Error::Denied(_))
+            ));
+            // A relative scope cannot climb out of the jail to cover it.
+            let c = cap(&["urn:cap:fs:read:docs/../.."]);
+            assert!(invoke(ep, Verb::Source, "top.txt", &c, &[]).is_err());
+            let c = cap(&["urn:cap:fs:read:.", "urn:cap:fs:read:-../x"]);
+            assert!(invoke(ep, Verb::Source, "top.txt", &c, &[]).is_ok());
+            // An absolute scope still names the host path, under either mount.
+            let c = cap(&[&read_scope(&absolute)]);
+            assert!(invoke(ep, Verb::Source, "top.txt", &c, &[]).is_ok());
+        }
+        std::fs::remove_dir_all(&relative).ok();
+    }
+
     #[test]
     fn a_deny_on_a_name_not_yet_on_disk_binds_without_regard_to_normalization() {
         // `café.txt` composed (NFC, U+00E9) and decomposed (NFD, `e` + U+0301) are one
@@ -3646,6 +3740,86 @@ mod tests {
         let read = invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]);
         assert!(matches!(read, Err(Error::Denied(_))), "{read:?}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A jail-relative deny and a deny spelled through a link, together, under a root
+    /// mounted by a relative spelling (ledger #230 with ledger #3494): a relative deny
+    /// inside the jail binds, a relative deny spelled through a link inside the jail
+    /// binds the file the link leads to (resolved from the jail, not the working
+    /// directory), an absolute deny through a link to the jail binds, and no allow is
+    /// widened through a link.
+    #[cfg(unix)]
+    #[test]
+    fn relative_and_linked_denies_bind_under_a_relative_mounted_root() {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let relative = PathBuf::from(format!(
+            "target/ikigai-fs-reldeny-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(relative.join("releases/v2")).unwrap();
+        std::fs::create_dir_all(relative.join("docs")).unwrap();
+        std::fs::write(relative.join("releases/v2/secret.txt"), b"PRIVATE").unwrap();
+        std::fs::write(relative.join("releases/v2/open.txt"), b"public").unwrap();
+        std::fs::write(relative.join("docs/a.txt"), b"a").unwrap();
+        std::fs::write(relative.join("top.txt"), b"t").unwrap();
+        std::os::unix::fs::symlink("releases/v2", relative.join("current")).unwrap();
+        let absolute = std::env::current_dir().unwrap().join(&relative);
+        // A link OUTSIDE the jail that leads to it.
+        let outside =
+            std::env::temp_dir().join(format!("ikigai-fs-reldeny-link-{}-{n}", std::process::id()));
+        std::fs::remove_file(&outside).ok();
+        std::os::unix::fs::symlink(&absolute, &outside).unwrap();
+        let ep = FileEndpoint::new(&relative);
+        let denied = |r: Result<Representation>| matches!(r, Err(Error::Denied(_)));
+
+        // A relative deny inside the jail.
+        let c = cap(&["urn:cap:fs:read:.", "urn:cap:fs:read:-docs"]);
+        assert!(denied(invoke(&ep, Verb::Source, "docs/a.txt", &c, &[])));
+        assert!(invoke(&ep, Verb::Source, "top.txt", &c, &[]).is_ok());
+
+        // A relative deny spelled through a link inside the jail binds the file the
+        // link leads to; the listing omits it.
+        let c = cap(&["urn:cap:fs:read:.", "urn:cap:fs:read:-current/secret.txt"]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/secret.txt", &c, &[]);
+        assert!(denied(read), "relative deny through an in-jail link");
+        let listed = invoke(&ep, Verb::Source, "releases/v2", &c, &[]).unwrap();
+        assert_eq!(listed.bytes, b"open.txt");
+
+        // An absolute deny spelled through a link to the jail binds too.
+        let deny = outside.join("releases/v2/secret.txt");
+        let c = cap(&[
+            "urn:cap:fs:read:.",
+            &format!("urn:cap:fs:read:-{}", deny.display()),
+        ]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/secret.txt", &c, &[]);
+        assert!(denied(read), "absolute deny through a link to the jail");
+        assert!(invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]).is_ok());
+
+        // Both at once, beside a relative deny inside the jail.
+        let c = cap(&[
+            "urn:cap:fs:read:.",
+            "urn:cap:fs:read:-docs",
+            "urn:cap:fs:read:-current/secret.txt",
+            &format!("urn:cap:fs:read:-{}", outside.join("top.txt").display()),
+        ]);
+        for denied_name in ["docs/a.txt", "releases/v2/secret.txt", "top.txt"] {
+            let read = invoke(&ep, Verb::Source, denied_name, &c, &[]);
+            assert!(denied(read), "{denied_name}");
+        }
+        assert!(invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]).is_ok());
+
+        // No ALLOW is widened through a link: neither a relative one inside the jail
+        // nor an absolute one through a link to it.
+        let c = cap(&["urn:cap:fs:read:current"]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]);
+        assert!(denied(read), "relative allow through an in-jail link");
+        let c = cap(&[&format!("urn:cap:fs:read:{}", outside.display())]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]);
+        assert!(denied(read), "absolute allow through a link to the jail");
+
+        std::fs::remove_file(&outside).ok();
+        std::fs::remove_dir_all(&relative).ok();
     }
 
     // --- links, kinds and handles (native) ------------------------------------------

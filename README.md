@@ -61,8 +61,17 @@ Carried as `urn:cap:fs:<action>:<path>` scopes, where `<action>` is `read` /
 | `urn:cap:fs:read:/ws` | read anything under `/ws` |
 | `urn:cap:fs:read:/ws/public` (only) | allowlist — read just that subtree |
 | `urn:cap:fs:read:/ws` + `urn:cap:fs:read:-/ws/secret` | read `/ws` except `secret` |
+| `urn:cap:fs:read:.` + `urn:cap:fs:read:-secret` | read the whole jail except its `secret` |
+| `urn:cap:fs:read:docs` | read the jail's `docs/` |
 
-A scope is placed into the jail before it is matched. Its path is normalized (`.`,
+A **relative** scope path names a path **inside the jail**: `docs` is the jail's
+`docs/` and `.` is the jail itself, whatever spelling the host mounted the root
+under and whatever the process's working directory. (Before 0.5.0 a relative scope
+was matched against the root's spelling as mounted, so `ws` meant a root mounted
+literally as `ws`; write `.` for that now.) An allow with `..` is ignored; a deny
+whose `..` climbs out of the jail is dropped.
+
+An **absolute** scope is placed into the jail before it is matched. Its path is normalized (`.`,
 repeated and trailing `/` dropped), then placed against the root under **either of
 the root's spellings** — as mounted, or canonical, so `/private/var/…` and `/var/…`
 name one jail on macOS — and the part inside the jail is resolved to its on-disk
@@ -70,7 +79,9 @@ names. A scope naming the root or an ancestor of it covers the whole jail. A den
 placed a second time with the existing part of its path resolved through the host's
 links, so a deny spelled through a link — to the jail, or inside it
 (`-/ws/current/secret` where `current` links to `releases/v2`) — also binds the file
-the link leads to; an allow is never widened that way.
+the link leads to; an allow is never widened that way. A relative deny is resolved
+the same way from the jail's canonical root (`-current/secret` binds
+`releases/v2/secret`), never from the process's working directory.
 
 Matching is **most specific wins, by path depth; deny breaks ties**; no matching
 rule is **default-deny**; a `root` capability allows everything *within the jail*.
@@ -395,6 +406,20 @@ One crate, a `cfg`-gated backend.
   meaning on Windows is refused before that, as a path, on every platform, so a
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
+
+## 0.5.0 (unreleased)
+
+- **A relative `urn:cap:fs:` scope is jail-relative** (ledger #230): `docs` names the
+  jail's `docs/` and `.` the jail itself, whatever spelling the host mounted the root
+  under and whatever the process's working directory. **Breaking**: a relative scope
+  used to be matched against the root's spelling as mounted, so `urn:cap:fs:read:ws`
+  covered only a root mounted literally as `ws` (relative to the process's working
+  directory). Such a grant now names a `ws/` inside the jail; write
+  `urn:cap:fs:read:.` (and `.../<id>` for `.../ws/<id>`). Absolute scopes are
+  unchanged. A relative deny is also mapped through the host's links, from the
+  jail's canonical root, so one spelled through a link inside the jail binds the
+  file the link leads to, as an absolute deny does; an allow never is.
+  Prepared only; do not publish.
 
 ## 0.4.2 (unreleased)
 
