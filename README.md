@@ -75,11 +75,18 @@ An **absolute** scope is placed into the jail before it is matched. Its path is 
 repeated and trailing `/` dropped), then placed against the root under **either of
 the root's spellings** — as mounted, or canonical, so `/private/var/…` and `/var/…`
 name one jail on macOS — and the part inside the jail is resolved to its on-disk
-names. A scope naming the root or an ancestor of it covers the whole jail.
+names. A scope naming the root or an ancestor of it covers the whole jail. A deny is
+placed a second time with the existing part of its path resolved through the host's
+links, so a deny spelled through a link — to the jail, or inside it
+(`-/ws/current/secret` where `current` links to `releases/v2`) — also binds the file
+the link leads to; an allow is never widened that way. A relative deny is resolved
+the same way from the jail's canonical root (`-current/secret` binds
+`releases/v2/secret`), never from the process's working directory.
 
 Matching is **most specific wins, by path depth; deny breaks ties**; no matching
 rule is **default-deny**; a `root` capability allows everything *within the jail*.
 A deny that names something not yet on disk is compared without regard to case
+or Unicode normalization (`café` composed or decomposed: one name to macOS's APFS)
 (the volume's rule for a name that does not exist cannot be read off the volume),
 which can only over-deny; an allow is never widened that way. These are
 owner-minted rule sets — the flat-scope `Capability` is untouched and this module
@@ -110,7 +117,8 @@ does the path-aware matching.
   (ownership, extended attributes, and hard-link identity are not preserved) and
   requires a writable parent directory. A killed process may leave an unpublished
   staging file. Power-loss durability of the directory entry is not guaranteed.
-  With `if-match` it is a [conditional write](#conditional-writes-ledger-3054).
+  With `if-match` it is a [conditional write](#conditional-writes-ledger-3054), and
+  with `if-none-match=*` a [create-only write](#create-only-writes-ledger-3297).
 - `Exists` / `Delete` — existence check (a read) and removal (a delete).
 
 ### Directory listings (ledger #2524)
@@ -131,6 +139,10 @@ source urn:file:searches as=text/uri-list .. ( urn:iki:fn:compose | urn:sparql:s
 `urn:file:searches/rss.rq`. The face uses newline separators with no trailing
 newline, so a map has no empty final member. A child directory is included too;
 source its URI to list its members. Empty directories answer an empty list.
+On Unix, `source urn:file:` lists the jail root itself. Its empty path needs
+`read` on the root, and child URIs have no leading slash. Both standard mounts
+accept this root URI. A missing jail root or file returns `Error::NotFound`;
+other failures to open the root remain endpoint errors.
 `text/uri-list` is accepted only for directories; files refuse it rather than
 relabel their content. Both the face and its `as` choice are declared on Source.
 
@@ -140,6 +152,8 @@ letters, digits, `-._~` and the `/` separators stay literal. For example,
 `%`, `#`, `?` and newlines in names are escaped too. Decoding happens before
 the jail and path-ACL checks; alternate encodings (including escaped `/` or
 unreserved bytes) are refused, preserving one URI per file and its cache thread.
+Hosts can call `ikigai_fs::encode_file_path` with a decoded, jail-relative UTF-8
+path and prepend `urn:file:` to obtain that same URI for watcher cache cuts.
 
 The jail's rules hold for the listing as for a read. The directory is walked like any
 path (no link, its on-disk spelling, `searches/` refused as not canonical) and needs
@@ -279,6 +293,36 @@ erased unseen. No lock file is added to the jail.
   and is refused as stale until the thread is cut.
 - A rename's durability across a power loss is as for any `Sink`: not guaranteed.
 
+### Create-only writes (ledger #3297)
+
+A `Sink` with `if-none-match=*` writes the file only if it does not exist yet, so a
+writer creating a file cannot overwrite one another writer created a moment earlier.
+
+- **No such file:** it is created as any `Sink` creates it, missing directories
+  included.
+- **The file exists, even empty:** `Conflict` saying it already exists; the file is
+  untouched and no staging file remains. Read it and reconsider: the endpoint never
+  retries.
+- **A directory at the name:** the `InvalidArgument` any `Sink` gets for one.
+- **Any value but `*`:** `InvalidArgument` naming `if-none-match`, and so is sending
+  `if-match` too, since no file satisfies both. A `Delete` with `if-none-match` is
+  refused the same way rather than deleting unconditionally.
+
+**A lost create is a `Conflict`, with or without the condition.** Publishing a new
+file uses `linkat`, which cannot overwrite a name, so of any number of writers that
+found the name free exactly one creates it. Every other is refused with `Conflict`
+saying another writer created it, and its content is not written. An unconditional
+`Sink` that tries again replaces the file, as it always would. The refusal does not
+depend on the directory's lock: `linkat` refuses a name however it appeared, an
+editor's included, and on a file system with no `flock`.
+
+**What it does not cover.**
+
+- The `wasm32` backend refuses `if-none-match` with `Unsupported`: `localStorage` has
+  no check-and-create across tabs.
+- Only a create is covered. A file replaced or removed since the walk found it
+  answers the existing `Endpoint` error saying `retry`.
+
 ## Mounting
 
 ```rust
@@ -372,7 +416,21 @@ One crate, a `cfg`-gated backend.
   covered only a root mounted literally as `ws` (relative to the process's working
   directory). Such a grant now names a `ws/` inside the jail; write
   `urn:cap:fs:read:.` (and `.../<id>` for `.../ws/<id>`). Absolute scopes are
-  unchanged.
+  unchanged. A relative deny is also mapped through the host's links, from the
+  jail's canonical root, so one spelled through a link inside the jail binds the
+  file the link leads to, as an absolute deny does; an allow never is.
+  Prepared only; do not publish.
+
+## 0.4.2 (unreleased)
+
+- **Create-only writes** (ledger #3297): a `Sink` with `if-none-match=*` writes the
+  file only if it does not exist yet, and otherwise refuses with `Conflict`. See
+  "Create-only writes" above. Additive for a caller, but `if-none-match` is a new
+  declared input, so **the Sink's contract IRI moves**.
+- A create that loses the race to another writer now answers `Conflict` instead of
+  the `Endpoint` error saying `retry`. A caller matching that message for a create
+  must match the kind instead.
+- A `Delete` carrying `if-none-match` is refused instead of ignoring it.
   Prepared only; do not publish.
 
 ## 0.4.1 (unreleased)

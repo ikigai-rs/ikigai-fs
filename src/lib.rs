@@ -57,26 +57,32 @@
 //! - `urn:cap:fs:read:/Users/brian/workspace` **+** `urn:cap:fs:read:-/Users/brian/workspace/secret`
 //!   — read the tree *except* `secret`.
 //!
+//! A scope's path is normalized first (`.`, repeated and trailing `/` dropped).
+//!
 //! A **relative** path names a path *inside the jail*: `urn:cap:fs:read:docs` is the
 //! jail's `docs/`, and `urn:cap:fs:read:.` the whole jail, whatever spelling the host
 //! mounted the root under and whatever the process's working directory (ledger
 //! #230). An allow with `..` is ignored; a deny's `..` that climbs out of the jail
 //! drops the rule.
 //!
-//! An **absolute** path names a host path. It is mapped into the jail before it is
-//! matched: normalized (`.`, repeated and trailing `/` dropped), placed against the
-//! root under either of the root's spellings — as mounted, or canonical
-//! (`/private/var/…` for `/var/…`) — and the part inside the jail is resolved to
-//! its on-disk names. A scope naming the root or an ancestor of it covers the whole
-//! jail.
+//! An **absolute** path names a host path. It is placed against the root under
+//! either of the root's spellings — as mounted, or canonical (`/private/var/…` for
+//! `/var/…`). A scope naming the root or an ancestor of it covers the whole jail.
+//!
+//! The part inside the jail is resolved to its on-disk names. A deny is placed once
+//! more with its existing prefix resolved through the host's links (a relative one
+//! from the jail's canonical root, never from the working directory), so one spelled
+//! through a link to the jail or inside it also binds the file the link leads to; an
+//! allow never is.
 //!
 //! Matching is **most specific wins, by path depth**, with **deny breaking
 //! ties**: for an `(action, path)`, the deepest rule whose directory contains the
 //! path decides; if a deny ties it, it's denied. No matching rule →
 //! **default-deny**. A `root` capability allows everything *within the jail*.
 //! Where a deny names something not on disk, it is compared without regard to
-//! case, since the volume's rule for a name that does not exist cannot be read
-//! off the volume; that can only over-deny. These are owner-minted rule sets — the
+//! case or Unicode normalization (`café` composed or decomposed), since the
+//! volume's rule for a name that does not exist cannot be read off the volume;
+//! that can only over-deny. These are owner-minted rule sets — the
 //! flat-scope [`Capability`] is untouched; this module does the path-aware
 //! matching, where path semantics belong.
 //!
@@ -171,6 +177,15 @@
 //! be in progress. The `wasm32` backend has no atomic compare across tabs, and refuses
 //! `if-match` the same way. Never ignored.
 //!
+//! A `Sink` with `if-none-match=*` writes the file only if it does not exist yet, and
+//! otherwise refuses with [`Error::Conflict`] and leaves the file as it was (ledger
+//! #3297). The new file is published with `linkat`, which cannot overwrite a name, so
+//! this needs no comparison and holds on a file system with no `flock` too. A create
+//! that loses to another writer between the walk and the `linkat` is the same
+//! `Conflict`, with or without the condition, so a caller can tell a lost race from a
+//! failure by its kind. The `wasm32` backend refuses `if-none-match` as it refuses
+//! `if-match`.
+//!
 //! ## Spilling
 //!
 //! On Unix, [`FileSpill`] is the file-backed spill facility (ledger #2241): a host
@@ -201,14 +216,35 @@ use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use ikigai_core::{
-    ActionSpec, ArgSpec, Body, Capability, Description, Endpoint, EndpointSpace, Error,
-    FailureClass, Invocation, ReprType, Representation, Result, UriTemplate, Verb,
+    ActionSpec, ArgSpec, Bindings, Body, Capability, Description, Endpoint, EndpointSpace, Error,
+    FailureClass, Grammar, Invocation, Iri, ReprType, Representation, Result, UriTemplate, Verb,
 };
 
 /// The conventional grammar a host mounts this module at: `urn:file:{path}`,
 /// where `{path}` is captured root-relative and handed to the endpoint as the
 /// `path` binding (so the file's *identity* is the request, not an argument).
+/// The standard mounts also accept `urn:file:` with an empty binding to list the jail root.
 pub const FILE_TEMPLATE: &str = "urn:file:{path}";
+
+// Core's URI template requires nonempty captures. The conventional file mount
+// also accepts the empty path, which names the jail root.
+struct FileGrammar(UriTemplate);
+
+impl Grammar for FileGrammar {
+    fn match_iri(&self, iri: &Iri) -> Option<Bindings> {
+        if iri.as_str() == "urn:file:" {
+            let mut bindings = Bindings::new();
+            bindings.insert("path", "");
+            Some(bindings)
+        } else {
+            self.0.match_iri(iri)
+        }
+    }
+
+    fn pattern(&self) -> String {
+        FILE_TEMPLATE.to_string()
+    }
+}
 
 /// Maximum native file payload returned by a `Source`: 16 MiB.
 ///
@@ -256,7 +292,7 @@ const OCTET_STREAM: &str = "application/octet-stream";
 /// want a different IRI grammar can bind [`FileEndpoint`] themselves.
 pub fn space(root: impl Into<PathBuf>) -> EndpointSpace {
     EndpointSpace::new().bind(
-        UriTemplate::parse(FILE_TEMPLATE).expect("FILE_TEMPLATE is a valid template"),
+        FileGrammar(UriTemplate::parse(FILE_TEMPLATE).expect("FILE_TEMPLATE is a valid template")),
         FileEndpoint::new(root),
     )
 }
@@ -267,7 +303,7 @@ pub fn space(root: impl Into<PathBuf>) -> EndpointSpace {
 /// kernel that auto-cuts on writes (`ikigai-core` ≥ 0.1.9).
 pub fn cacheable_space(root: impl Into<PathBuf>) -> EndpointSpace {
     EndpointSpace::new().bind(
-        UriTemplate::parse(FILE_TEMPLATE).expect("FILE_TEMPLATE is a valid template"),
+        FileGrammar(UriTemplate::parse(FILE_TEMPLATE).expect("FILE_TEMPLATE is a valid template")),
         FileEndpoint::new(root).cacheable(),
     )
 }
@@ -460,7 +496,11 @@ impl FileEndpoint {
                 .map(|child| {
                     format!(
                         "urn:file:{}",
-                        encode_file_path(&format!("{parent}/{child}"))
+                        encode_file_path(&if parent.is_empty() {
+                            child
+                        } else {
+                            format!("{parent}/{child}")
+                        })
                     )
                 })
                 .collect();
@@ -535,13 +575,15 @@ impl Endpoint for FileEndpoint {
                 }
             }
             Verb::Delete => {
-                if inv.request.args.contains_key("if-match") {
-                    return Err(Error::InvalidArgument {
-                        name: "if-match".to_string(),
-                        detail: "only a `Sink` compares; refused rather than deleted \
-                                 unconditionally"
-                            .to_string(),
-                    });
+                for condition in ["if-match", "if-none-match"] {
+                    if inv.request.args.contains_key(condition) {
+                        return Err(Error::InvalidArgument {
+                            name: condition.to_string(),
+                            detail: "only a `Sink` compares; refused rather than deleted \
+                                     unconditionally"
+                                .to_string(),
+                        });
+                    }
                 }
                 found.delete(iri)?;
                 Ok(ack(format!("deleted {rel}")))
@@ -600,7 +642,9 @@ impl Endpoint for FileEndpoint {
                  A `Source` of a directory yields its listing: the child names it may \
                  serve, sorted, one per line (never cached); `as=text/uri-list` gives full child URIs. \
                  A `Sink` with `if-match` replaces the file only while that is still the content id of \
-                 its `Source`, and otherwise refuses with Conflict naming the current one.",
+                 its `Source`, and otherwise refuses with Conflict naming the current one. \
+                 A `Sink` with `if-none-match=*` writes the file only if it does not exist yet, and \
+                 otherwise refuses with Conflict.",
             )
             .verb(Verb::Source)
             .verb(Verb::Sink)
@@ -624,6 +668,7 @@ impl Endpoint for FileEndpoint {
             )
             .input(sink_encoding_arg())
             .input(sink_if_match_arg())
+            .input(sink_if_none_match_arg())
             .input(
                 ArgSpec::new("as")
                     .summary("Source only: application/octet-stream for raw bytes; text/uri-list for full child URIs (directories only).")
@@ -701,9 +746,11 @@ impl Endpoint for FileEndpoint {
                     )
                     .input(sink_encoding_arg())
                     .input(sink_if_match_arg())
+                    .input(sink_if_none_match_arg())
                     .output("text/plain;charset=utf-8")
                     // `permanent`: refused content or path, a `Conflict` from a
-                    // streamed content's source or a stale `if-match`. `over-budget`:
+                    // streamed content's source, a stale `if-match`, an existing
+                    // file under `if-none-match` or a lost create. `over-budget`:
                     // content past a bound, the root's `max_write` among them.
                     // `transient`: the directory's lock held past `LOCK_WAIT`.
                     // `unknown`: an I/O failure.
@@ -744,8 +791,12 @@ fn cap_action(verb: Verb) -> Option<&'static str> {
 /// A path is accepted only in its one canonical spelling — `/`-separated names, none
 /// empty, none `.` or `..`, not absolute, none with another meaning on Windows
 /// ([`windows_meaning`]) — so two IRIs can never name one file through spelling alone. A
-/// refusal of a non-canonical spelling names the canonical one.
+/// refusal of a non-canonical spelling names the canonical one. The empty path
+/// names the jail root; it has no segments.
 fn canonical_names(rel: &str) -> Result<Vec<&str>> {
+    if rel.is_empty() {
+        return Ok(Vec::new());
+    }
     let names: Vec<&str> = rel.split('/').collect();
     if names.contains(&"..") {
         return Err(deny("parent-directory (`..`) segments are not allowed"));
@@ -876,6 +927,16 @@ fn sink_if_match_arg() -> ArgSpec {
         .optional()
 }
 
+fn sink_if_none_match_arg() -> ArgSpec {
+    ArgSpec::new("if-none-match")
+        .summary(
+            "Sink only: `*` writes the file only if it does not exist yet; otherwise Conflict. \
+             Omitted: an unconditional write. Not with if-match.",
+        )
+        .class(XSD_STRING)
+        .optional()
+}
+
 /// The Sink's `if-match`, judged before any content is read.
 #[cfg(unix)]
 fn sink_if_match(inv: &Invocation<'_>) -> Result<Option<ikigai_core::ContentId>> {
@@ -891,6 +952,32 @@ fn sink_if_match(inv: &Invocation<'_>) -> Result<Option<ikigai_core::ContentId>>
                      Source representation"
                 .to_string(),
         })
+}
+
+/// Whether the Sink carries `if-none-match=*`, judged before any content is read. The
+/// value is compared here rather than by a declared `one_of`, so that every other value
+/// and a request that also carries `if-match` are refused in one place.
+#[cfg(unix)]
+fn sink_create_only(inv: &Invocation<'_>) -> Result<bool> {
+    if !inv.request.args.contains_key("if-none-match") {
+        return Ok(false);
+    }
+    let refused = |detail: &str| Error::InvalidArgument {
+        name: "if-none-match".to_string(),
+        detail: detail.to_string(),
+    };
+    if inv.inline_str("if-none-match")? != "*" {
+        return Err(refused(
+            "expected `*`, the one value this endpoint serves: write only if the file does not \
+             exist yet",
+        ));
+    }
+    if inv.request.args.contains_key("if-match") {
+        return Err(refused(
+            "`if-match` needs the file to exist and `if-none-match` needs it not to: send one",
+        ));
+    }
+    Ok(true)
 }
 
 /// How a Sink's `content` is encoded.
@@ -1031,8 +1118,8 @@ impl Decoder {
 /// decoded incrementally ([`Decoder`]) into the staging file chunk by chunk and
 /// published only once it ended cleanly: a stream that fails part-way, content
 /// that does not decode, content past `max_write` (checked before each chunk
-/// reaches the disk), or an `if-match` that no longer holds at publication leaves the
-/// target untouched and no staging file behind.
+/// reaches the disk), an `if-match` that no longer holds at publication, or a create
+/// that lost to another writer leaves the target untouched and no staging file behind.
 #[cfg(unix)]
 async fn sink(
     inv: &Invocation<'_>,
@@ -1041,7 +1128,7 @@ async fn sink(
     max_write: u64,
 ) -> Result<u64> {
     let encoding = sink_encoding(inv)?;
-    let found = found.conditional(sink_if_match(inv)?);
+    let found = found.conditional(sink_if_match(inv)?, sink_create_only(inv)?);
     let body = inv.content_body("content").await?;
     if let Body::Bytes(bytes) = &body {
         let content = decode_whole(encoding, bytes)?;
@@ -1077,14 +1164,19 @@ async fn sink(
     max_write: u64,
 ) -> Result<u64> {
     // One `get_item` and one `set_item` are two operations to another tab of the origin.
-    if inv.request.args.contains_key("if-match") {
-        return Err(Error::Unsupported {
-            verb: Some(Verb::Sink),
-            detail: format!(
-                "`{iri}`: this backend cannot compare and replace atomically, so `if-match` is \
-                 refused rather than ignored; nothing was written"
-            ),
-        });
+    for (condition, what) in [
+        ("if-match", "compare and replace"),
+        ("if-none-match", "check and create"),
+    ] {
+        if inv.request.args.contains_key(condition) {
+            return Err(Error::Unsupported {
+                verb: Some(Verb::Sink),
+                detail: format!(
+                    "`{iri}`: this backend cannot {what} atomically, so `{condition}` is \
+                     refused rather than ignored; nothing was written"
+                ),
+            });
+        }
     }
     let encoding = sink_encoding(inv)?;
     let collected = inv.collect(inv.content_body("content").await?).await?;
@@ -1139,11 +1231,25 @@ fn wants_uri_list(inv: &Invocation<'_>) -> Result<bool> {
         && inv.inline_str("as")?.eq_ignore_ascii_case("text/uri-list"))
 }
 
-/// One URI spelling per disk path, preserving only unreserved bytes and separators.
+/// Encode a UTF-8 relative path for the path portion of a `urn:file:` URI.
+///
+/// Preserves unreserved ASCII bytes and `/`; all other UTF-8 bytes become
+/// uppercase percent escapes. Hosts can use this spelling to cut the same cache
+/// thread the endpoint uses after a watcher observes a path change. Pass the
+/// decoded path relative to the jail, without the `urn:file:` prefix.
+/// This encodes the path; the endpoint still validates its spelling and authority.
+///
+/// ```
+/// use ikigai_fs::encode_file_path;
+/// assert_eq!(
+///     format!("urn:file:{}", encode_file_path("queries/café notes.rq")),
+///     "urn:file:queries/caf%C3%A9%20notes.rq"
+/// );
+/// ```
 // Keep this local: ikigai_core::encode_name preserves non-ASCII IRI characters,
 // while file paths require ASCII-only URIs with uppercase UTF-8 escapes and literal
 // unreserved bytes and `/`. Re-encoding after decoding enforces that one spelling.
-fn encode_file_path(path: &str) -> String {
+pub fn encode_file_path(path: &str) -> String {
     let mut out = String::new();
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
@@ -1210,7 +1316,17 @@ impl Acl {
                     Some(d) => (false, d),
                     None => (true, rest),
                 };
-                if let Some(rule) = Rule::map(dir, rule_allows, &roots, jail) {
+                let rule = Rule::map(dir, rule_allows, &roots, jail);
+                // A deny binds the file it names however it is spelled: one spelled
+                // through a link inside the jail (`current/secret` for
+                // `releases/v2/secret`) binds the name the link resolves to as well,
+                // the only one the jail serves it under. Allows get no such leniency.
+                let resolved = if rule_allows {
+                    None
+                } else {
+                    Rule::map_resolved(dir, &roots, jail)
+                };
+                for rule in rule.into_iter().chain(resolved) {
                     rules.push((rule, rule_allows));
                 }
             }
@@ -1294,10 +1410,9 @@ impl Rule {
     ///
     /// The path is normalized lexically first (so `/ws/secret/` and `/ws/secret` are
     /// one directory, of one depth). An allow containing `..` is ignored (fail
-    /// closed); a deny's `..` is applied lexically. A deny that matches neither root
-    /// spelling is tried once more with its existing prefix resolved through the
-    /// host's links, so a deny spelled through a link to the jail still binds;
-    /// allows get no such leniency.
+    /// closed); a deny's `..` is applied lexically. A deny is also mapped a second
+    /// time, through the host's links ([`Rule::map_resolved`]); allows get no such
+    /// leniency.
     ///
     /// A relative path (`docs`, `.`) is jail-relative: it names a path inside the
     /// jail, whatever spelling the host mounted the root under and whatever the
@@ -1306,35 +1421,49 @@ impl Rule {
     fn map(dir: &str, allows: bool, roots: &Roots, jail: &backend::Jail) -> Option<Rule> {
         let scope = lexical(Path::new(dir), !allows)?;
         if is_jail_relative(Path::new(dir)) {
-            return Some(Rule::within(scope, allows, jail));
+            return Some(Rule::of(Placed::Within(scope), !allows, jail));
         }
         let placed = roots
             .spellings
             .iter()
-            .find_map(|root| place(&scope, root))
-            .or_else(|| {
-                if allows {
-                    return None;
-                }
-                let resolved = backend::resolve_host_path(Path::new(dir))?;
-                place(&lexical(&resolved, true)?, roots.canonical.as_deref()?)
-            })?;
-        Some(match placed {
-            Placed::Covers(depth) => Rule::Covers(depth),
-            Placed::Within(rest) => Rule::within(rest, allows, jail),
-        })
+            .find_map(|root| place(&scope, root))?;
+        Some(Rule::of(placed, !allows, jail))
     }
 
-    /// The rule for `rest`, a normalized path inside the jail (empty: the root).
-    fn within(rest: Vec<OsString>, allows: bool, jail: &backend::Jail) -> Rule {
-        if rest.is_empty() {
-            return Rule::Covers(0);
-        }
-        let (names, on_disk) = jail.on_disk_names(&rest);
-        Rule::Within {
-            names,
-            on_disk,
-            deny: !allows,
+    /// A deny's path with its existing prefix resolved through the host's links, mapped
+    /// into the jail against the canonical root, or `None` when it resolves outside it:
+    /// so a deny spelled through a link to the jail, or through a link inside it, binds
+    /// the file the link leads to.
+    ///
+    /// A jail-relative deny is resolved from the jail's canonical root, never from the
+    /// process's working directory (ledger #230); its `..` is applied lexically first,
+    /// as [`Rule::map`] does, and one that climbs out of the jail maps to nothing.
+    fn map_resolved(dir: &str, roots: &Roots, jail: &backend::Jail) -> Option<Rule> {
+        let canonical = roots.canonical.as_deref()?;
+        let host = if is_jail_relative(Path::new(dir)) {
+            let mut host = jail.canonical_root()?;
+            host.extend(lexical(Path::new(dir), true)?);
+            host
+        } else {
+            PathBuf::from(dir)
+        };
+        let resolved = backend::resolve_host_path(&host)?;
+        let placed = place(&lexical(&resolved, true)?, canonical)?;
+        Some(Rule::of(placed, true, jail))
+    }
+
+    fn of(placed: Placed, deny: bool, jail: &backend::Jail) -> Rule {
+        match placed {
+            Placed::Covers(depth) => Rule::Covers(depth),
+            Placed::Within(rest) if rest.is_empty() => Rule::Covers(0),
+            Placed::Within(rest) => {
+                let (names, on_disk) = jail.on_disk_names(&rest);
+                Rule::Within {
+                    names,
+                    on_disk,
+                    deny,
+                }
+            }
         }
     }
 
@@ -1359,7 +1488,8 @@ impl Rule {
                     && names.iter().zip(target).enumerate().all(|(i, (rule, t))| {
                         if *deny && i >= *on_disk {
                             // A deny naming something not on disk: the volume's case
-                            // rule for it is unknowable, so compare without case.
+                            // and normalization rules for it are unknowable, so compare
+                            // without either.
                             caseless_eq(rule, t)
                         } else {
                             rule.as_os_str() == OsStr::new(t)
@@ -1424,9 +1554,13 @@ fn lexical(path: &Path, resolve_parents: bool) -> Option<Vec<OsString>> {
     Some(out)
 }
 
+/// Whether a volume that folds case or Unicode normalization could open `a` and `b` as
+/// one name: equal once each is lowercased and canonically decomposed (NFD), so `Café`,
+/// `café` composed and `cafe\u{301}` decomposed all match. Used only to over-deny.
 fn caseless_eq(a: &OsStr, b: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization;
     match a.to_str() {
-        Some(a) => a == b || a.to_lowercase() == b.to_lowercase(),
+        Some(a) => a == b || a.to_lowercase().nfd().eq(b.to_lowercase().nfd()),
         None => false,
     }
 }
@@ -1525,6 +1659,9 @@ mod backend {
                 Mode::empty(),
             )
             .map_err(|e| {
+                if e == Errno::NOENT {
+                    return not_found(iri);
+                }
                 Error::Endpoint(format!(
                     "`{iri}`: the endpoint's jail root cannot be opened ({e}); nothing is \
                      served until it exists"
@@ -1578,7 +1715,18 @@ mod backend {
         /// anything. Refuses a link anywhere and a spelling that is not the on-disk
         /// one; stops quietly at the first name that does not exist.
         pub(super) fn probe(self, names: &[&str], iri: &str) -> Result<Found> {
-            let (leaf, dirs) = names.split_last().expect("canonical_names is non-empty");
+            let Some((leaf, dirs)) = names.split_last() else {
+                let stat = rfs::fstat(&self.root).map_err(|e| io_error("look up", iri, e))?;
+                return Ok(Found {
+                    dir: self.root,
+                    names: Vec::new(),
+                    reached: 0,
+                    blocked: false,
+                    leaf: Some(stat),
+                    if_match: None,
+                    create_only: false,
+                });
+            };
             let mut dir = self.root;
             for (reached, name) in dirs.iter().enumerate() {
                 match step(&dir, name, &names[..=reached], iri)? {
@@ -1605,6 +1753,7 @@ mod backend {
                 blocked: false,
                 leaf: leaf_stat,
                 if_match: None,
+                create_only: false,
             })
         }
     }
@@ -1621,11 +1770,18 @@ mod backend {
         leaf: Option<rfs::Stat>,
         /// A write's `if-match`: the content id the file must still have when published.
         if_match: Option<ikigai_core::ContentId>,
+        /// A write's `if-none-match=*`: the file must not exist yet.
+        create_only: bool,
     }
 
     impl Found {
-        pub(super) fn conditional(mut self, if_match: Option<ikigai_core::ContentId>) -> Found {
+        pub(super) fn conditional(
+            mut self,
+            if_match: Option<ikigai_core::ContentId>,
+            create_only: bool,
+        ) -> Found {
             self.if_match = if_match;
+            self.create_only = create_only;
             self
         }
 
@@ -1637,11 +1793,13 @@ mod backend {
                 blocked,
                 leaf: None,
                 if_match: None,
+                create_only: false,
             }
         }
 
         fn leaf_name(&self) -> &str {
-            self.names.last().expect("non-empty")
+            // An empty name list denotes the opened root directory itself.
+            self.names.last().map(String::as_str).unwrap_or(".")
         }
 
         fn shown(&self) -> String {
@@ -1790,6 +1948,10 @@ mod backend {
             }
             if let Some(stat) = &self.leaf {
                 require_regular(stat, &shown)?;
+                // A name that appears after this is refused by `linkat` at publication.
+                if self.create_only {
+                    return Err(already_exists(iri));
+                }
             }
             // A missing file matches no token: refused before a directory is created.
             if let (Some(token), None) = (self.if_match, &self.leaf) {
@@ -1889,7 +2051,8 @@ mod backend {
 
         /// Sync the staging file and publish it at the target: `renameat` over an
         /// existing file (an open reader keeps the old inode and its bytes), or
-        /// `linkat` for a new one (never overwriting a name that appeared since).
+        /// `linkat` for a new one (never overwriting a name that appeared since, and
+        /// answering [`Error::Conflict`] when one did).
         ///
         /// The directory's lock ([`lock_dir`]) spans the `if-match` comparison and the
         /// publication, so a conditional write is one operation to every writer that
@@ -1952,7 +2115,7 @@ mod backend {
                 // since the probe. Drop removes only the temporary second name.
                 rfs::linkat(dir, staged.name.as_str(), dir, leaf, AtFlags::empty()).map_err(
                     |e| match e {
-                        Errno::EXIST => changed(iri),
+                        Errno::EXIST => lost_create(iri),
                         e => io_error("publish", iri, e),
                     },
                 )?;
@@ -2528,6 +2691,22 @@ mod backend {
         ))
     }
 
+    /// A create-only write (`if-none-match=*`) to a file that is there.
+    fn already_exists(iri: &str) -> Error {
+        Error::Conflict(format!(
+            "`{iri}` already exists, and `if-none-match` is `*`; nothing was written; read it \
+             again"
+        ))
+    }
+
+    /// A create that another writer's create beat to the name.
+    fn lost_create(iri: &str) -> Error {
+        Error::Conflict(format!(
+            "`{iri}` was created by another writer while this request was being served; nothing \
+             was written; read it again"
+        ))
+    }
+
     fn changed(iri: &str) -> Error {
         Error::Endpoint(format!(
             "`{iri}` changed on disk while the request was being served; retry"
@@ -2544,7 +2723,7 @@ mod backend {
     }
 
     /// A host path with its existing prefix resolved through links (the rest kept as
-    /// written). Used only to place a DENY scope spelled through a link to the jail.
+    /// written). Used only to place a DENY scope spelled through a link.
     pub(super) fn resolve_host_path(path: &Path) -> Option<PathBuf> {
         if !path.is_absolute() {
             return None;
@@ -3210,7 +3389,8 @@ mod tests {
                 "{bad}: {err:?}"
             );
         }
-        for bad in ["", ".", "/abs", "../up", "a/../b", "nul\0byte"] {
+        assert!(canonical_names("").unwrap().is_empty());
+        for bad in [".", "/abs", "../up", "a/../b", "nul\0byte"] {
             assert!(
                 matches!(canonical_names(bad), Err(Error::InvalidArgument { .. })),
                 "{bad:?}"
@@ -3493,6 +3673,152 @@ mod tests {
             let c = cap(&[&read_scope(&absolute)]);
             assert!(invoke(ep, Verb::Source, "top.txt", &c, &[]).is_ok());
         }
+        std::fs::remove_dir_all(&relative).ok();
+    }
+
+    #[test]
+    fn a_deny_on_a_name_not_yet_on_disk_binds_without_regard_to_normalization() {
+        // `café.txt` composed (NFC, U+00E9) and decomposed (NFD, `e` + U+0301) are one
+        // name to macOS's APFS: the volume's normalization rule for a name that does
+        // not exist cannot be read off the volume either, so the deny over-denies.
+        let root = temp_root();
+        let ep = FileEndpoint::new(&root);
+        let c = cap(&[
+            &write_scope(&root),
+            &format!("urn:cap:fs:write:-{}", root.join("caf\u{e9}.txt").display()),
+        ]);
+        let err = invoke(&ep, Verb::Sink, "cafe%CC%81.txt", &c, &[("content", b"x")]).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "nothing was created"
+        );
+        // The same holds the other way round, and past a case difference too.
+        let c = cap(&[
+            &write_scope(&root),
+            &format!("urn:cap:fs:write:-{}", root.join("Cafe\u{301}").display()),
+        ]);
+        let err = invoke(&ep, Verb::Sink, "caf%C3%A9/x.txt", &c, &[("content", b"x")]).unwrap_err();
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "nothing was created"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_deny_spelled_through_a_link_inside_the_jail_binds_the_file_it_names() {
+        // `current` is a link to `releases/v2`: the owner's deny on
+        // `current/secret.txt` names `releases/v2/secret.txt`, the only spelling the
+        // jail serves it under.
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("releases/v2")).unwrap();
+        std::fs::write(root.join("releases/v2/secret.txt"), b"PRIVATE").unwrap();
+        std::fs::write(root.join("releases/v2/open.txt"), b"public").unwrap();
+        std::os::unix::fs::symlink("releases/v2", root.join("current")).unwrap();
+        let ep = FileEndpoint::new(&root);
+        {
+            let deny = root.join("current/secret.txt");
+            let c = cap(&[
+                &read_scope(&root),
+                &format!("urn:cap:fs:read:-{}", deny.display()),
+            ]);
+            let read = invoke(&ep, Verb::Source, "releases/v2/secret.txt", &c, &[]);
+            assert!(matches!(read, Err(Error::Denied(_))), "{deny:?}: {read:?}");
+            let listed = invoke(&ep, Verb::Source, "releases/v2", &c, &[]).unwrap();
+            assert_eq!(listed.bytes, b"open.txt", "{deny:?}");
+        }
+        // An ALLOW spelled through the link is never widened to the target.
+        let c = cap(&[&format!(
+            "urn:cap:fs:read:{}",
+            root.join("current").display()
+        )]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]);
+        assert!(matches!(read, Err(Error::Denied(_))), "{read:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A jail-relative deny and a deny spelled through a link, together, under a root
+    /// mounted by a relative spelling (ledger #230 with ledger #3494): a relative deny
+    /// inside the jail binds, a relative deny spelled through a link inside the jail
+    /// binds the file the link leads to (resolved from the jail, not the working
+    /// directory), an absolute deny through a link to the jail binds, and no allow is
+    /// widened through a link.
+    #[cfg(unix)]
+    #[test]
+    fn relative_and_linked_denies_bind_under_a_relative_mounted_root() {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let relative = PathBuf::from(format!(
+            "target/ikigai-fs-reldeny-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(relative.join("releases/v2")).unwrap();
+        std::fs::create_dir_all(relative.join("docs")).unwrap();
+        std::fs::write(relative.join("releases/v2/secret.txt"), b"PRIVATE").unwrap();
+        std::fs::write(relative.join("releases/v2/open.txt"), b"public").unwrap();
+        std::fs::write(relative.join("docs/a.txt"), b"a").unwrap();
+        std::fs::write(relative.join("top.txt"), b"t").unwrap();
+        std::os::unix::fs::symlink("releases/v2", relative.join("current")).unwrap();
+        let absolute = std::env::current_dir().unwrap().join(&relative);
+        // A link OUTSIDE the jail that leads to it.
+        let outside =
+            std::env::temp_dir().join(format!("ikigai-fs-reldeny-link-{}-{n}", std::process::id()));
+        std::fs::remove_file(&outside).ok();
+        std::os::unix::fs::symlink(&absolute, &outside).unwrap();
+        let ep = FileEndpoint::new(&relative);
+        let denied = |r: Result<Representation>| matches!(r, Err(Error::Denied(_)));
+
+        // A relative deny inside the jail.
+        let c = cap(&["urn:cap:fs:read:.", "urn:cap:fs:read:-docs"]);
+        assert!(denied(invoke(&ep, Verb::Source, "docs/a.txt", &c, &[])));
+        assert!(invoke(&ep, Verb::Source, "top.txt", &c, &[]).is_ok());
+
+        // A relative deny spelled through a link inside the jail binds the file the
+        // link leads to; the listing omits it.
+        let c = cap(&["urn:cap:fs:read:.", "urn:cap:fs:read:-current/secret.txt"]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/secret.txt", &c, &[]);
+        assert!(denied(read), "relative deny through an in-jail link");
+        let listed = invoke(&ep, Verb::Source, "releases/v2", &c, &[]).unwrap();
+        assert_eq!(listed.bytes, b"open.txt");
+
+        // An absolute deny spelled through a link to the jail binds too.
+        let deny = outside.join("releases/v2/secret.txt");
+        let c = cap(&[
+            "urn:cap:fs:read:.",
+            &format!("urn:cap:fs:read:-{}", deny.display()),
+        ]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/secret.txt", &c, &[]);
+        assert!(denied(read), "absolute deny through a link to the jail");
+        assert!(invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]).is_ok());
+
+        // Both at once, beside a relative deny inside the jail.
+        let c = cap(&[
+            "urn:cap:fs:read:.",
+            "urn:cap:fs:read:-docs",
+            "urn:cap:fs:read:-current/secret.txt",
+            &format!("urn:cap:fs:read:-{}", outside.join("top.txt").display()),
+        ]);
+        for denied_name in ["docs/a.txt", "releases/v2/secret.txt", "top.txt"] {
+            let read = invoke(&ep, Verb::Source, denied_name, &c, &[]);
+            assert!(denied(read), "{denied_name}");
+        }
+        assert!(invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]).is_ok());
+
+        // No ALLOW is widened through a link: neither a relative one inside the jail
+        // nor an absolute one through a link to it.
+        let c = cap(&["urn:cap:fs:read:current"]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]);
+        assert!(denied(read), "relative allow through an in-jail link");
+        let c = cap(&[&format!("urn:cap:fs:read:{}", outside.display())]);
+        let read = invoke(&ep, Verb::Source, "releases/v2/open.txt", &c, &[]);
+        assert!(denied(read), "absolute allow through a link to the jail");
+
+        std::fs::remove_file(&outside).ok();
         std::fs::remove_dir_all(&relative).ok();
     }
 
