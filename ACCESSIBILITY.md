@@ -11,7 +11,7 @@ decides how a person sees it. It is not a conformance claim. Adapted from the
 | Status | Evaluation in progress. No conformance claim. |
 | Owner | the maintainers of this repository |
 | Report a barrier | [a GitHub issue](https://github.com/ikigai-rs/ikigai-fs/issues/new?labels=accessibility) with the `accessibility` label; anything security-sensitive through [private vulnerability reporting](https://github.com/ikigai-rs/ikigai-fs/security/advisories/new) |
-| Last reviewed | 2026-11-08 |
+| Last reviewed | 2026-11-12 |
 
 ## What it emits that people read
 
@@ -29,7 +29,7 @@ All of it is in `src/lib.rs` unless named otherwise.
   `if-none-match=*` on a file that already exists, a value other than `*` or one sent with
   `if-match`, and a backend that cannot check and create atomically; and a create that lost to
   another writer. The spill store (`src/spill.rs`) has its own errors.
-- **Acknowledgements** (`text/plain`): `wrote N bytes to <path>` for a `Sink`, `deleted <path>`
+- **Acknowledgments** (`text/plain`): `wrote N bytes to <path>` for a `Sink`, `deleted <path>`
   for a `Delete`, and `true` or `false` for an `Exists`.
 - **Directory listings**: a directory's `Source` is its child names, sorted, one per line
   (`text/plain`), or their full `urn:file:` URIs under `as=text/uri-list`.
@@ -56,49 +56,59 @@ so it writes nothing to a terminal.
 
 ## How it is tested
 
-- `tests/audit_regressions.rs`'s `f4_errors_never_name_the_host_path` pins that a read, a delete
-  and two writes that fail never name the host path.
-- `src/lib.rs`'s `a_path_has_one_canonical_spelling` pins that a non-canonical path is refused
-  with the spelling to use.
-- `tests/bodies.rs`, `tests/reads_body.rs` and `tests/sink_encoding.rs` pin the `wrote N bytes
-  to <path>` acknowledgement; `tests/bodies.rs` pins `changed while read`;
-  `tests/max_write.rs`'s `one_byte_past_the_ceiling_is_refused_with_nothing_left_behind` pins
-  that the refusal states the ceiling.
-- `tests/listing.rs`'s `a_directory_sources_as_the_newline_list_of_its_child_names` pins the
-  listing's form.
-- `tests/if_match.rs`'s `a_stale_token_is_refused_naming_the_current_one_and_changes_nothing`
-  pins that a stale `if-match` names the request and the current content id, says `read it again`
-  and never names the host path; `a_missing_file_matches_no_token_and_nothing_is_created` and
-  `a_lock_held_past_the_wait_is_a_transient_refusal` pin the others' words the same way.
-- `tests/if_none_match.rs`'s `an_existing_file_is_refused_naming_the_request_and_changes_nothing`
-  and `two_unconditional_writers_creating_one_file_lose_the_race_as_conflict` pin that the
-  create-only refusal and the lost create name the request, say `read it again` and never name
-  the host path.
+Every named check has a result: Pass, Fail or Blocked. Pass covers only the stated
+assertions, not overall accessibility. The test results below come from `cargo test
+--workspace` on main commit `37965dec5ffd1ccac6d7a658cb71434ebbb8de92`, on Linux,
+2026-11-12 (America/Los_Angeles), with Cargo 1.99.0 and rustc 1.99.0. CI repeats these
+native tests through `.github/workflows/ci.yml`; it also runs macOS tests, Windows jail
+name tests and a wasm32 library lint. A build or lint is not a browser or assistive
+technology evaluation. Linux does not exercise the browser backend or the tests that
+require a case- or normalization-folding volume.
 
-The other messages are followed by reading and not tested. **No automated accessibility checker,
-browser or assistive technology has been used on this output.**
+| Check | Result | Evidence |
+|---|---|---|
+| Host paths absent from selected request errors | Pass | `tests/audit_regressions.rs`: `f4_errors_never_name_the_host_path`, run by the command above. Checks a failed read, a delete and two writes; does not cover every error or spill configuration errors. |
+| Canonical path spelling hint | Pass | `src/lib.rs`: `a_path_has_one_canonical_spelling`, run by the command above. Checks hints for four non-canonical paths and rejection of other invalid paths; not every path refusal. |
+| Write acknowledgments | Pass | `tests/bodies.rs`, `tests/reads_body.rs` and `tests/sink_encoding.rs`, run by the command above. Assert acknowledgment bytes or their prefix for selected writes; no host presentation evaluation. |
+| File changed while read | Pass | `tests/bodies.rs`, run by the command above. Asserts a conflict containing `changed while read`; does not assert all recovery wording. |
+| Write ceiling refusal | Pass | `tests/max_write.rs`: `one_byte_past_the_ceiling_is_refused_with_nothing_left_behind`, run by the command above. Asserts the stated 16-byte ceiling for the tested write forms. |
+| Directory listing form | Pass | `tests/listing.rs`: `a_directory_sources_as_the_newline_list_of_its_child_names`, run by the command above. Asserts sorted names, one per line, including a subdirectory, and the text media type; no assistive technology evaluation. |
+| Stale conditional write refusal | Pass | `tests/if_match.rs`: `a_stale_token_is_refused_naming_the_current_one_and_changes_nothing`, run by the command above. Asserts request, current content id, `read it again`, absence of the host path and unchanged file. |
+| Missing conditional write target and lock timeout | Pass | `tests/if_match.rs`: `a_missing_file_matches_no_token_and_nothing_is_created` asserts request and `does not exist`; `a_lock_held_past_the_wait_is_a_transient_refusal` asserts request and `retry`. Both run by the command above; neither asserts absence of the host path. |
+| Create-only refusal and lost create | Pass | `tests/if_none_match.rs`: `an_existing_file_is_refused_naming_the_request_and_changes_nothing` and `two_unconditional_writers_creating_one_file_lose_the_race_as_conflict`, run by the command above. Assert request, `read it again` and absence of the host path for these conflicts. |
+| Remaining refusal and recovery wording; delete and existence acknowledgments; endpoint description | Blocked | No complete current wording evaluation. The tests above cover selected assertions only; earlier source reading is not verification of every message. |
+| No generated color, terminal control codes or markup | Blocked | No exhaustive check of output, including caller-controlled names and operating system error text, was run. |
+| Rendered documentation and host presentation: keyboard, focus, contrast, zoom and reflow | Blocked | No interactive browser or terminal host evaluation was available for this update. This library supplies text; its host controls presentation. |
+| Automated accessibility checker | Blocked | No axe or other automated accessibility checker was run; no rendered host was configured for this update. Rust tests do not evaluate WCAG conformance. |
+| Screen reader | Blocked | No screen reader session was available; no screen reader was used on this output. |
+| Screen magnifier | Blocked | No magnifier session was available; no screen magnifier was used on this output. |
+| Speech input | Blocked | No speech-input session was available; no speech-input software was used on this output. |
+| Switch access | Blocked | No switch-access session was available; no switch-access software was used on this output. |
+| Braille display | Blocked | No braille display was available or used on this output. |
 
 ## Known limitations
 
-Found by reading the source on 2026-10-31, not by testing:
+These limitations were rechecked by reading the named source on the same main commit
+on 2026-11-12. Fail records the described limitation, not a WCAG conformance verdict.
+Source inspection does not demonstrate the experience in a host or with assistive technology.
 
-- A directory listing does not say which names are directories: a subdirectory is listed exactly
-  as a file is.
-- `file endpoint does not support the … verb` names the verb in its Rust spelling and does not
-  name the request.
-- On the browser (`wasm32`) backend, a storage failure says only `localStorage error`, and a
-  failed write adds `(quota?)`, a guess; neither says what to do.
-- `stage … temporary name collisions` and `spill: temporary name collisions` say what failed but
-  not what to do.
-- The spill store's errors (`src/spill.rs`) name its directory as a host path; it is the host's
-  own configuration, not a request's.
+| Check | Result | Evidence |
+|---|---|---|
+| Distinguish files from directories in listings | Fail | `tests/listing.rs`'s listing fixture and `src/lib.rs`: child names carry no directory indicator; a subdirectory is listed exactly as a file is. The listing test above confirms the form. |
+| Unsupported verb refusal names the request in plain language | Fail | Source inspection of `src/lib.rs`: `file endpoint does not support the … verb` uses the verb's Rust spelling and omits the request. No runtime accessibility evaluation. |
+| Browser storage failure gives a recovery action | Fail | Source inspection of the wasm32 backend in `src/lib.rs`: storage failures say `localStorage error`, with `(quota?)` added for writes, and give no recovery action. Browser runtime check is Blocked: no browser storage-failure session was run. |
+| Temporary-name collision refusal gives a recovery action | Fail | Source inspection of `src/lib.rs` and `src/spill.rs`: `stage … temporary name collisions` and `spill: temporary name collisions` give no recovery action. No collision was induced in this review. |
+| Spill configuration errors avoid host paths | Fail | Source inspection of `FileSpill::new` in `src/spill.rs`: errors include the configured spill directory's host path. This is host configuration, not a request path. No runtime failure was induced in this review. |
 
 ## Contributing
 
-Read this file before changing any output listed above: an error's words, an acknowledgement, a
+Read this file before changing any output listed above: an error's words, an acknowledgment, a
 listing or the endpoint's description. Keep meaning in words, name the request a message is
-about, and never the host path. Say in the pull request what was tested, with what, and what was
-not.
+about, and never the host path. In the pull request's Accessibility section, give each check a
+row in a Check | Result | Evidence table: Pass, Fail or Blocked, with the test or command,
+tool and version used, or why it could not run. Keep unrun checks as Blocked, including
+assistive technologies nobody used. Historical runs that CI does not repeat remain Blocked
+with their dates until rerun.
 
 ## Reporting a barrier
 
@@ -116,3 +126,4 @@ if you are comfortable sharing it. Anything security-sensitive goes through
 | 2026-10-31 | First version. |
 | 2026-11-03 | Listed and tested the conditional write's refusals. |
 | 2026-11-08 | Listed and tested the create-only write's refusals and the lost create. |
+| 2026-11-12 | Recorded scoped test results, source-reviewed limitations and explicit blocked evaluations. |
