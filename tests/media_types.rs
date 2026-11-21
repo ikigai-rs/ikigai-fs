@@ -103,8 +103,8 @@ fn unknown_and_missing_extensions_keep_utf8_and_binary_fallbacks() {
     }
 }
 
-/// `ikigai-json` on core 0.2, in its own kernel (see `old_core`). When its core 0.3 release
-/// (wave 1) is published, bind it beside the file module in one kernel again.
+/// `ikigai-json` on core 0.2, in its own kernel (see `old_core`). When its core 0.4 release
+/// is published, bind it beside the file module in one kernel again.
 #[test]
 fn geojson_queries_answer_through_the_kernel_like_json() {
     let root = Root::new("query");

@@ -163,8 +163,8 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-/// `ikigai-web` on core 0.2, in its own kernel (see `old_core`). When its core 0.3 release (the
-/// cli workspace, wave 5) is published, serve the file module from one kernel again.
+/// `ikigai-web` on core 0.2, in its own kernel (see `old_core`). When its core 0.4 release (the
+/// cli workspace, wave 6) is published, serve the file module from one kernel again.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_door_answers_a_range_of_a_large_file() {
     let root = Root::new("door");

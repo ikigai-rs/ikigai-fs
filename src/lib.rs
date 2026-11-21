@@ -420,9 +420,9 @@ impl FileEndpoint {
         if !acl.allows(&names) {
             // Typed `Denied` — a permanent authority failure the trace, manifold,
             // and wire recognize as a 403-equivalent without sniffing message text.
-            return Err(Error::Denied(format!(
-                "capability does not grant `{action}` on `{rel}`"
-            )));
+            return Err(Error::Denied(
+                format!("capability does not grant `{action}` on `{rel}`").into(),
+            ));
         }
 
         // Layer 1, structural half: walk the names from the root handle.
