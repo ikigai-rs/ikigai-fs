@@ -407,6 +407,17 @@ One crate, a `cfg`-gated backend.
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
 
+## 0.6.0 (unreleased)
+
+- Move to `ikigai-core` 0.4.0 and `ikigai-conformance` 0.15.0 (the core 0.4.0
+  cascade, epic #3893). **Minor version**: the public API speaks core 0.4 types,
+  so a host moves with core. A refusal is now core's structured `Denial`; its
+  message is unchanged. No other behavior change.
+- Test-only: the `ikigai-web`, `ikigai-json`, `ikigai-engine`, `ikigai-fn` and
+  `ikigai-sparql` tests still reach this crate through the bridge from a core 0.2
+  kernel, now to a core 0.4 endpoint. A library build has core 0.4 alone.
+  Prepared only; do not publish.
+
 ## 0.5.0 (unreleased)
 
 - **A relative `urn:cap:fs:` scope is jail-relative** (ledger #230): `docs` names the

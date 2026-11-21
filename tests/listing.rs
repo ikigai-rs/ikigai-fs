@@ -263,7 +263,7 @@ fn a_directory_still_is_not_a_file_to_delete_or_sink() {
 }
 
 /// `ikigai-engine`, `ikigai-sparql` and `ikigai-fn` on core 0.2, in their own kernel (see
-/// `old_core`). When all three have core 0.3 releases (wave 3 is the engine's), bind the file
+/// `old_core`). When all three have core 0.4 releases (wave 4 is the engine's), bind the file
 /// module beside them in one kernel again.
 fn saved_search_engine(root: &Root) -> ikigai_engine::Engine {
     let space =

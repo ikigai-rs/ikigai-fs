@@ -1,11 +1,11 @@
-//! The bridge from a test's core 0.2 kernel to this crate's core 0.3 file endpoint.
+//! The bridge from a test's core 0.2 kernel to this crate's core 0.4 file endpoint.
 //!
-//! `ikigai-web`, `ikigai-json`, `ikigai-engine`, `ikigai-fn` and `ikigai-sparql` have no
-//! release on core 0.3 yet, so a test of this crate through one of them has two cores. The
-//! old-core crate runs in a kernel of its own, and `urn:file:` there forwards to a real core
-//! 0.3 kernel over [`ikigai_fs::space`]. Only bytes, their media type and what the door needs
+//! `ikigai-web`, `ikigai-json`, `ikigai-engine`, `ikigai-fn` and `ikigai-sparql` are tested
+//! here on their core 0.2 releases, so a test of this crate through one of them has two
+//! cores. The old-core crate runs in a kernel of its own, and `urn:file:` there forwards to a
+//! real core 0.4 kernel over [`ikigai_fs::space`]. Only bytes, their media type and what the door needs
 //! to frame them cross (see the manifest for when this goes). A caller's capability does not
-//! cross: every test here issues as root, and the ACL is pinned by the tests on core 0.3.
+//! cross: every test here issues as root, and the ACL is pinned by the tests on core 0.4.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ pub fn bind_file(space: old::EndpointSpace, root: &Path) -> old::EndpointSpace {
 
 struct FileBridge(ikigai_core::Kernel);
 
-/// The request as core 0.3 spells it: the bridge serves `Source`, with inline arguments.
+/// The request as core 0.4 spells it: the bridge serves `Source`, with inline arguments.
 fn request(inv: &old::Invocation<'_>) -> old::Result<ikigai_core::Request> {
     if inv.request.verb != old::Verb::Source {
         return Err(old::Error::Endpoint("the bridge only serves Source".into()));
@@ -53,7 +53,7 @@ fn repr_type(new: &ikigai_core::ReprType) -> old::ReprType {
 fn error(new: ikigai_core::Error) -> old::Error {
     match new {
         ikigai_core::Error::NotFound(detail) => old::Error::NotFound(detail),
-        ikigai_core::Error::Denied(detail) => old::Error::Denied(detail),
+        ikigai_core::Error::Denied(denial) => old::Error::Denied(denial.message().to_string()),
         ikigai_core::Error::InvalidArgument { name, detail } => {
             old::Error::InvalidArgument { name, detail }
         }
@@ -100,7 +100,7 @@ impl old::Endpoint for FileBridge {
     }
 }
 
-/// A core 0.3 file body as a core 0.2 one: the same reads, length and validator.
+/// A core 0.4 file body as a core 0.2 one: the same reads, length and validator.
 struct ReplayBridge(Arc<dyn ikigai_core::Replay>);
 
 impl old::Replay for ReplayBridge {
