@@ -407,6 +407,16 @@ One crate, a `cfg`-gated backend.
   Windows backend inherits the rule rather than having to remember it; ci.yml's
   `windows-jail` job builds the crate on `windows-latest` and observes both.
 
+## 0.7.0 (unreleased)
+
+- Upgrade to `ikigai-core` 0.5.0 and `ikigai-conformance` 0.16.0. This is a
+  minor release because public APIs carry core types; hosts must upgrade to core
+  0.5 with this crate. There are no persisted state changes and no migration is
+  needed.
+- The five older integration dependencies remain test-only and use the core 0.2
+  bridge. This crate has no `time_left` callers, so core's operational-time
+  change needs no call-site adjustments.
+
 ## 0.6.0 (unreleased)
 
 - Move to `ikigai-core` 0.4.0 and `ikigai-conformance` 0.15.0 (the core 0.4.0
