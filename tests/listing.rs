@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use futures::executor::block_on;
 use ikigai_core::{
-    ArgRef, Bindings, Capability, Endpoint, Error, Invocation, Iri, Kernel, ReprType, Request, Verb,
+    ArgRef, AsyncFnEndpoint, Bindings, Capability, Endpoint, Error, Exact, Invocation, Iri, Kernel,
+    ReprType, Representation, Request, Verb,
 };
 use ikigai_core_for_old_modules as old;
 use ikigai_fs::FileEndpoint;
@@ -376,12 +377,83 @@ fn uri_members_encode_each_utf8_path_and_round_trip_through_the_kernel() {
 }
 
 #[test]
+fn a_missing_uri_listing_is_not_found() {
+    let root = Root::new("missing-uri-listing");
+    let ep = FileEndpoint::new(&root.0);
+    let cap = Capability::scoped([format!("urn:cap:fs:read:{}", root.0.display())]);
+    let request = uri_listing_request("urn:file:missing");
+    let mut bindings = Bindings::new();
+    bindings.insert("path", "missing");
+    let inv = Invocation::detached(&request, &bindings, &cap);
+    for result in [
+        block_on(ep.invoke(&inv)).map(|_| ()),
+        block_on(ep.invoke_body(&inv)).map(|_| ()),
+    ] {
+        assert!(
+            matches!(&result, Err(Error::NotFound(detail)) if detail == "`urn:file:missing` does not exist"),
+            "{result:?}"
+        );
+    }
+}
+
+#[test]
+fn a_cached_fallback_is_cut_when_the_missing_directory_appears() {
+    let root = Root::new("missing-listing-thread");
+    let directory = "urn:file:missing";
+    let fallback = AsyncFnEndpoint::new("listing-fallback", move |inv| {
+        Box::pin(async move {
+            match inv.issue(uri_listing_request(directory)).await {
+                Err(Error::NotFound(_)) => Ok(Representation::new(
+                    ReprType::new("text/plain"),
+                    b"fallback".to_vec(),
+                )
+                .cacheable()),
+                other => other,
+            }
+        })
+    });
+    let kernel = Kernel::new(Arc::new(
+        ikigai_fs::space(&root.0).bind(Exact::new("urn:test:listing-fallback"), fallback),
+    ));
+    let cap = Capability::root();
+    let request = Request::new(
+        Verb::Source,
+        Iri::parse("urn:test:listing-fallback").unwrap(),
+    );
+    let read = || block_on(kernel.issue(request.clone(), &cap)).unwrap().bytes;
+
+    assert_eq!(read(), b"fallback");
+    assert!(kernel.is_cached(&request, &cap));
+
+    let child = "urn:file:missing/child.txt";
+    let sink = Request::new(Verb::Sink, Iri::parse(child).unwrap())
+        .with_arg("content", ArgRef::Inline(b"new".to_vec()));
+    block_on(kernel.issue(sink, &cap)).unwrap();
+    // Sink auto-cuts only the child. A watcher observing the new directory cuts its name.
+    assert!(kernel.is_cached(&request, &cap));
+    kernel.cut(directory);
+    assert!(!kernel.is_cached(&request, &cap));
+    assert_eq!(read(), child.as_bytes());
+}
+
+fn uri_listing_request(uri: &str) -> Request {
+    Request::new(Verb::Source, Iri::parse(uri).unwrap())
+        .with_arg("as", ArgRef::Inline(b"text/uri-list".to_vec()))
+}
+
+#[test]
 fn uri_face_is_directory_only_and_declared_on_the_source_contract() {
     let root = Root::new("uri-contract");
     root.write("file.rq", b"SELECT 1");
     let ep = FileEndpoint::new(&root.0);
+    let err = source_face(&ep, "file.rq", &Capability::root(), Some("text/uri-list")).unwrap_err();
     assert!(
-        matches!(source_face(&ep, "file.rq", &Capability::root(), Some("text/uri-list")), Err(Error::InvalidArgument { name, .. }) if name == "as")
+        matches!(&err, Error::InvalidArgument { name, detail }
+            if name == "as"
+                && detail.contains("`urn:file:file.rq` is not a directory")
+                && detail.contains("Use text/uri-list only for directories.")
+                && !detail.contains(&*root.0.to_string_lossy())),
+        "{err:?}"
     );
     let description = ep.describe();
     description.validate().unwrap();

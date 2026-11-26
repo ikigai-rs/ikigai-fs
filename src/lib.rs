@@ -429,11 +429,19 @@ impl FileEndpoint {
         let found = jail.probe(&names, iri)?;
         let names = names.into_iter().map(str::to_owned).collect();
         let uri_list = verb == Verb::Source && wants_uri_list(inv)?;
-        if uri_list && !found.is_dir() {
-            return Err(Error::InvalidArgument {
-                name: "as".into(),
-                detail: "text/uri-list is a directory listing face only".into(),
-            });
+        if uri_list {
+            if !found.exists() {
+                // Core records an atom's NotFound under its own resource thread.
+                return Err(Error::NotFound(format!("`{iri}` does not exist")));
+            }
+            if !found.is_dir() {
+                return Err(Error::InvalidArgument {
+                    name: "as".into(),
+                    detail: format!(
+                        "`{iri}` is not a directory. Use text/uri-list only for directories."
+                    ),
+                });
+            }
         }
         Ok(Admitted {
             rel: decoded,
