@@ -125,7 +125,7 @@ fn assert_shape(report: &Report, cacheable: bool) {
             probe.endpoint == ENDPOINT
                 && ((probe.verb == Verb::Delete
                     && probe.check == Check::Outputs
-                    && probe.reason.starts_with("never fired under root:"))
+                    && probe.reason == "not probed: mutating action (no content= for the pipeline probe to fire)")
                     || (!cacheable
                         && probe.verb == Verb::Source
                         && probe.check == Check::Bodies
